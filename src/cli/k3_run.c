@@ -766,6 +766,7 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
         w->cached = 0;
         int T = np, nraw = 0, frc = 0;
         K3Sampler sampler; k3_sampler_init(&sampler, temperature, top_p, seed, (uint64_t)(turn + 1));
+        const double t_turn0 = now_s();
         while (nraw < gen) {
             if (incremental) {
                 if (!nraw) {
@@ -784,6 +785,11 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
                 fprintf(stderr, "chat: sampler failed\n"); frc = -1; break;
             }
             (*seq)[T++] = next; outtok[nraw++] = next;
+            /* One line per token on stderr, unbuffered. At the speeds a streamed trunk
+             * runs at (a minute or two per token), a REPL that prints nothing until the
+             * turn is complete is indistinguishable from a hung one, and a turn cut off
+             * by --gen or a timeout would otherwise leave no record of how far it got. */
+            fprintf(stderr, "chat: token %d/%d id %d (%.0f s)\n", nraw, gen, next, now_s() - t_turn0);
             if (next == tmpl->eom_id || next == tmpl->eos_id) {
                 printf("chat: turn ended by %s (%d)\n", next == tmpl->eom_id ? "<|end_of_msg|>" : "[EOS]", next);
                 break;
