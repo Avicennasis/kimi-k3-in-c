@@ -469,6 +469,17 @@ same transcript with the same seed is reproducible. The 32K prompt / 4096 genera
 are existing engine limits, not new chat limits; chat fails clearly and retains the history
 when either context or safe KV allocation is reached.
 
+Thinking is on by default with `thinking_effort=max`, which is exactly what the checkpoint's
+own tokenizer does when `apply_chat_template` is given nothing; `--thinking-effort low` or
+`high` changes only that setting. `--no-think` is the encoder's `thinking=False`: no
+thinking-effort system message, prior assistant turns rendered without a think channel, and
+a generation prompt that opens the response channel directly, so the model answers at once
+and the REPL prints no `<think>` block. On a streamed trunk this is the largest speed lever
+there is: in a real-checkpoint run, 119 of the 150 tokens of a five-word answer were the
+think block. Reasoning already stored in the transcript is left in place and is rendered
+again the next time the conversation runs with thinking on. Both flags are byte- and
+id-exact against the official tokenizer in `tests/unit/test_chat.c`.
+
 Chat uses the same CPU-only streamed trunk and routed-expert cache as batch mode. `--preset`,
 `--trunk-gb`, and `--cache-gb` keep exactly their existing meanings: no experts are preloaded
 and the trunk remains disk-streamed unless those existing memory flags ask otherwise.

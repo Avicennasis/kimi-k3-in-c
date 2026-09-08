@@ -389,6 +389,9 @@ static void usage(FILE *f)
 "  --top-p P             nucleus probability for chat sampling (default 0.95)\n"
 "  --seed N              chat sampling seed; any of these three turns sampling on\n"
 "  --greedy              force argmax even when a sampling flag was given\n"
+"  --no-think            answer in the response channel directly: no think channel and\n"
+"                        no thinking-effort message (the encoder's thinking=False)\n"
+"  --thinking-effort E   low, high or max (default max, as the checkpoint's tokenizer sets)\n"
 "\n"
 "diagnostics:\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
@@ -676,11 +679,11 @@ static int chat_read_line(char **out)
     *out = line; return 1;
 }
 
-static int chat_render_ids(Tok *tok, const K3ChatHistory *history,
+static int chat_render_ids(Tok *tok, const K3ChatHistory *history, const K3ChatOptions *opts,
                            int **ids_out, int *n_out, char *err, size_t err_n)
 {
     K3ChatSegments segs;
-    if (k3_chat_render(history, 1, &segs, err, err_n) != 0) return -1;
+    if (k3_chat_render_opts(history, 1, opts, &segs, err, err_n) != 0) return -1;
     /* One sentinel slot distinguishes a prompt exactly at the engine limit from one
      * that the tokenizer would otherwise silently truncate. */
     int *ids = (int *)malloc((size_t)(K3_MAX_PROMPT + 1) * sizeof(*ids));
@@ -729,7 +732,7 @@ static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
 }
 
 static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history,
-                    const char *history_path, int **prompt_ref, int np, int gen,
+                    const K3ChatOptions *opts, const char *history_path, int **prompt_ref, int np, int gen,
                     int incremental, int greedy, double temperature, double top_p,
                     uint64_t seed, Weights *w, const K3Cfg *c, K3Cache *cache,
                     int nl, int *tmax, float **h, float **br, float *ks,
@@ -801,10 +804,11 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
             return 1;
         }
         K3ChatMessage assistant;
-        if (k3_chat_parse_assistant(tok, tmpl, outtok, nraw, &assistant, err, sizeof err) != 0) {
+        if (k3_chat_parse_assistant_opts(tok, tmpl, opts, outtok, nraw, &assistant, err, sizeof err) != 0) {
             fprintf(stderr, "chat: malformed assistant turn: %s\n", err); return 1;
         }
-        printf("<think>%s</think>\n<response>%s</response>\n", assistant.reasoning_content, assistant.content);
+        if (assistant.reasoning_content) printf("<think>%s</think>\n", assistant.reasoning_content);
+        printf("<response>%s</response>\n", assistant.content);
         if (k3_chat_history_add(history, K3_CHAT_ASSISTANT, assistant.content,
                                 assistant.reasoning_content, err, sizeof err) != 0) {
             fprintf(stderr, "chat: %s\n", err); k3_chat_message_free(&assistant); return 1;
@@ -830,7 +834,7 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
             if (k3_chat_history_add(history, K3_CHAT_USER, line, NULL, err, sizeof err)) { fprintf(stderr, "chat: %s\n", err); free(line); return 1; }
             free(line);
             int *new_prompt = NULL, new_np = 0;
-            if (chat_render_ids(tok, history, &new_prompt, &new_np, err, sizeof err) != 0 || new_np > K3_MAX_PROMPT) {
+            if (chat_render_ids(tok, history, opts, &new_prompt, &new_np, err, sizeof err) != 0 || new_np > K3_MAX_PROMPT) {
                 if (new_prompt) free(new_prompt);
                 k3_chat_message_free(&history->v[--history->n]);
                 fprintf(stderr, "chat: %s\n", new_np > K3_MAX_PROMPT ? "context limit reached; history was not changed" : err);
@@ -879,6 +883,8 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, chat = 0, greedy = 0;
+    K3ChatOptions chat_opts = k3_chat_options_default();
+    int no_think = 0, effort_set = 0;
     int temperature_set = 0, top_p_set = 0, seed_set = 0, out_set = 0;
     double temperature = 1.0, top_p = 0.95;
     uint64_t seed = 0;
@@ -919,6 +925,8 @@ int main(int argc, char **argv)
             seed_set = 1;
         }
         else if (!strcmp(argv[i], "--greedy")) greedy = 1;
+        else if (!strcmp(argv[i], "--no-think")) { chat_opts.thinking = 0; no_think = 1; }
+        else if (!strcmp(argv[i], "--thinking-effort") && i + 1 < argc) { chat_opts.thinking_effort = argv[++i]; effort_set = 1; }
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -969,6 +977,20 @@ int main(int argc, char **argv)
         return 2;
     }
     if (chat && !gen_set) gen = K3_MAX_GEN;
+    if ((no_think || effort_set) && !chat) {
+        fprintf(stderr, "%s only applies to --chat\n", no_think ? "--no-think" : "--thinking-effort");
+        return 2;
+    }
+    if (no_think && effort_set) {
+        /* The encoder silently ignores thinking_effort once thinking is off. A CLI that did
+         * the same would run a very long prompt under a setting the user never got. */
+        fprintf(stderr, "--no-think and --thinking-effort contradict each other; pass one of them\n");
+        return 2;
+    }
+    if (chat) {
+        char oerr[256];
+        if (k3_chat_options_validate(&chat_opts, oerr, sizeof oerr) != 0) { fprintf(stderr, "--thinking-effort: %s\n", oerr); return 2; }
+    }
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
         if (chat && nsrc) {
@@ -1167,14 +1189,16 @@ int main(int argc, char **argv)
             free(line);
             break;
         }
-        if (chat_render_ids(&tok, &chat_history, &prompt, &np, err, sizeof err) != 0) {
+        if (chat_render_ids(&tok, &chat_history, &chat_opts, &prompt, &np, err, sizeof err) != 0) {
             fprintf(stderr, "chat: %s\n", err); return 2;
         }
         if (history_path && k3_chat_history_save(&chat_history, history_path, err, sizeof err) != 0) {
             fprintf(stderr, "chat: %s\n", err); return 2;
         }
-        printf("  XTML prompt: %d ids, generation limit %d, %s\n", np, gen,
-               greedy ? "greedy" : "temperature/top-p sampling");
+        printf("  XTML prompt: %d ids, generation limit %d, %s, %s%s\n", np, gen,
+               greedy ? "greedy" : "temperature/top-p sampling",
+               chat_opts.thinking ? "thinking_effort=" : "thinking off",
+               chat_opts.thinking ? chat_opts.thinking_effort : "");
         if (!greedy) printf("  sampler  : PCG32 seed %llu, temperature %.3f, top-p %.3f\n",
                             (unsigned long long)seed, temperature, top_p);
     } else {
@@ -1531,7 +1555,7 @@ int main(int argc, char **argv)
     }
 
     if (chat) {
-        const int rc = chat_run(&tok, &chat_template, &chat_history, history_path,
+        const int rc = chat_run(&tok, &chat_template, &chat_history, &chat_opts, history_path,
                                 &prompt, np, gen, incremental, greedy, temperature,
                                 top_p, seed, &w, &c, &cache, NL, &Tmax, &h, &br, ks,
                                 &sc, lg, &seq, outtok, maxb, kper);
