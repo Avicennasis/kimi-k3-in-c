@@ -325,33 +325,68 @@ int k3_chat_template_init(Tok *tok, K3ChatTemplate *t, char *err, size_t err_n)
 {
     t->open_id = tok_id_of(tok, "<|open|>"); t->close_id = tok_id_of(tok, "<|close|>");
     t->sep_id = tok_id_of(tok, "<|sep|>"); t->eom_id = tok_id_of(tok, "<|end_of_msg|>");
+    t->eos_id = tok_id_of(tok, "[EOS]");
     if (t->open_id < 0 || t->close_id < 0 || t->sep_id < 0 || t->eom_id < 0) {
         fail(err, err_n, "K3 tokenizer is missing required XTML control tokens"); return -1;
     }
     if (t->eom_id != 163586) { fail(err, err_n, "K3 end_of_msg id is %d, expected official id 163586", t->eom_id); return -1; }
+    if (t->eos_id != 163585) { fail(err, err_n, "K3 [EOS] id is %d, expected official id 163585", t->eos_id); return -1; }
     return 0;
+}
+
+static const char *const efforts[] = { "low", "high", "max" };
+
+K3ChatOptions k3_chat_options_default(void)
+{
+    K3ChatOptions o; o.thinking = 1; o.thinking_effort = "max"; return o;
+}
+
+int k3_chat_options_validate(const K3ChatOptions *o, char *err, size_t err_n)
+{
+    if (!o->thinking) return 0;
+    for (size_t i = 0; o->thinking_effort && i < sizeof efforts / sizeof efforts[0]; i++)
+        if (!strcmp(o->thinking_effort, efforts[i])) return 0;
+    /* The prompt text itself lists `medium`, but the checkpoint's encoder asserts on it
+     * (_VALID_THINKING_EFFORTS = {"low", "high", "max"}), so it is refused here too. */
+    fail(err, err_n, "thinking_effort must be low, high or max, got '%s'", o->thinking_effort ? o->thinking_effort : "");
+    return -1;
 }
 
 int k3_chat_render(const K3ChatHistory *h, int add_generation_prompt,
                    K3ChatSegments *out, char *err, size_t err_n)
 {
-    static const char thinking[] =
-        "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), "
-        "supported values include `low`, `medium`, `high`, and `max`.\n"
-        "Now the system is invoked with `thinking_effort=max`.";
+    K3ChatOptions o = k3_chat_options_default();
+    return k3_chat_render_opts(h, add_generation_prompt, &o, out, err, err_n);
+}
+
+int k3_chat_render_opts(const K3ChatHistory *h, int add_generation_prompt,
+                        const K3ChatOptions *o, K3ChatSegments *out, char *err, size_t err_n)
+{
+    /* One segment, never split around the value: the encoder renders this body as a single
+     * text piece, and BPE merges run across "=max", so a split would change the ids. */
+    char thinking[512];
     k3_chat_segments_init(out);
-    if (k3_chat_history_validate(h, err, err_n)) return -1;
-    if (open_tag(out, "message", " role=\"system\" type=\"thinking-effort\"", err, err_n) || txt(out, thinking, err, err_n) || close_tag(out, "message", err, err_n) || eom(out, err, err_n)) goto bad;
+    if (k3_chat_options_validate(o, err, err_n) || k3_chat_history_validate(h, err, err_n)) return -1;
+    if (o->thinking) {
+        snprintf(thinking, sizeof thinking,
+                 "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), "
+                 "supported values include `low`, `medium`, `high`, and `max`.\n"
+                 "Now the system is invoked with `thinking_effort=%s`.", o->thinking_effort);
+        if (open_tag(out, "message", " role=\"system\" type=\"thinking-effort\"", err, err_n) || txt(out, thinking, err, err_n) || close_tag(out, "message", err, err_n) || eom(out, err, err_n)) goto bad;
+    }
     for (int i = 0; i < h->n; i++) {
         const K3ChatMessage *m = &h->v[i]; char attrs[64];
         snprintf(attrs, sizeof attrs, " role=\"%s\"", role_name(m->role));
         if (open_tag(out, "message", attrs, err, err_n)) goto bad;
         if (m->role == K3_CHAT_ASSISTANT) {
-            if (open_tag(out, "think", NULL, err, err_n) || txt(out, m->reasoning_content ? m->reasoning_content : "", err, err_n) || close_tag(out, "think", err, err_n) || open_tag(out, "response", NULL, err, err_n) || txt(out, m->content, err, err_n) || close_tag(out, "response", err, err_n)) goto bad;
+            /* With thinking off the encoder drops the think channel entirely, even when the
+             * transcript carries reasoning from an earlier thinking turn. */
+            if (o->thinking && (open_tag(out, "think", NULL, err, err_n) || txt(out, m->reasoning_content ? m->reasoning_content : "", err, err_n) || close_tag(out, "think", err, err_n))) goto bad;
+            if (open_tag(out, "response", NULL, err, err_n) || txt(out, m->content, err, err_n) || close_tag(out, "response", err, err_n)) goto bad;
         } else if (txt(out, m->content, err, err_n)) goto bad;
         if (close_tag(out, "message", err, err_n) || eom(out, err, err_n)) goto bad;
     }
-    if (add_generation_prompt && (open_tag(out, "message", " role=\"assistant\"", err, err_n) || open_tag(out, "think", NULL, err, err_n))) goto bad;
+    if (add_generation_prompt && (open_tag(out, "message", " role=\"assistant\"", err, err_n) || open_tag(out, o->thinking ? "think" : "response", NULL, err, err_n))) goto bad;
     return 0;
 bad:
     k3_chat_segments_free(out); return -1;
@@ -398,16 +433,33 @@ static char *decode_ids(Tok *tok, const int *ids, int n)
 int k3_chat_parse_assistant(Tok *tok, const K3ChatTemplate *t, const int *ids, int n,
                             K3ChatMessage *out, char *err, size_t err_n)
 {
+    K3ChatOptions o = k3_chat_options_default();
+    return k3_chat_parse_assistant_opts(tok, t, &o, ids, n, out, err, err_n);
+}
+
+int k3_chat_parse_assistant_opts(Tok *tok, const K3ChatTemplate *t, const K3ChatOptions *o,
+                                 const int *ids, int n, K3ChatMessage *out, char *err, size_t err_n)
+{
     int think[64], response[64], message[64], a[128], z[128];
     int nt = ids_for(tok, "think", think), nr = ids_for(tok, "response", response), nm = ids_for(tok, "message", message);
     int na = 0, nz = 0;
     a[na++] = t->close_id; memcpy(a + na, think, (size_t)nt * sizeof(int)); na += nt; a[na++] = t->sep_id; a[na++] = t->open_id; memcpy(a + na, response, (size_t)nr * sizeof(int)); na += nr; a[na++] = t->sep_id;
-    z[nz++] = t->close_id; memcpy(z + nz, response, (size_t)nr * sizeof(int)); nz += nr; z[nz++] = t->sep_id; z[nz++] = t->close_id; memcpy(z + nz, message, (size_t)nm * sizeof(int)); nz += nm; z[nz++] = t->sep_id; z[nz++] = t->eom_id;
-    int split = -1, end = -1;
-    for (int i = 0; i < n; i++) if (match(ids, n, i, a, na)) { split = i; break; }
-    if (split < 0) { fail(err, err_n, "assistant output has no <think> to <response> boundary"); return -1; }
-    for (int i = split + na; i < n; i++) if (match(ids, n, i, z, nz)) { end = i; break; }
-    if (end < 0 || end + nz != n) { fail(err, err_n, "assistant output is missing the official response/message/end_of_msg closure"); return -1; }
+    z[nz++] = t->close_id; memcpy(z + nz, response, (size_t)nr * sizeof(int)); nz += nr; z[nz++] = t->sep_id; z[nz++] = t->close_id; memcpy(z + nz, message, (size_t)nm * sizeof(int)); nz += nm; z[nz++] = t->sep_id;
+    /* split: end of the think payload; body: start of the response payload.  With thinking
+     * off the generation prompt already opened the response channel, so both are 0. */
+    int split = 0, body = 0, end = -1;
+    if (o->thinking) {
+        split = -1;
+        for (int i = 0; i < n; i++) if (match(ids, n, i, a, na)) { split = i; break; }
+        if (split < 0) { fail(err, err_n, "assistant output has no <think> to <response> boundary"); return -1; }
+        body = split + na;
+    }
+    for (int i = body; i < n; i++) if (match(ids, n, i, z, nz)) { end = i; break; }
+    /* The closure is followed by exactly one end id, and either declared id is accepted:
+     * the released model ends its turn with [EOS], the template inserts <|end_of_msg|>. */
+    if (end < 0 || end + nz != n - 1 || (ids[n - 1] != t->eom_id && ids[n - 1] != t->eos_id)) {
+        fail(err, err_n, "assistant output is missing the official response/message closure and end id"); return -1;
+    }
     /* Stored transcript text is re-encoded with special tokens disabled.  Accepting a
      * control id in either payload would therefore make a restart differ from the live
      * turn, so treat it as malformed instead of silently changing the conversation. */
@@ -415,13 +467,13 @@ int k3_chat_parse_assistant(Tok *tok, const K3ChatTemplate *t, const int *ids, i
         if (ids[i] >= 0 && ids[i] < tok->n_ids && tok->id_added[ids[i]]) {
             fail(err, err_n, "assistant reasoning contains an unexpected control token"); return -1;
         }
-    for (int i = split + na; i < end; i++)
+    for (int i = body; i < end; i++)
         if (ids[i] >= 0 && ids[i] < tok->n_ids && tok->id_added[ids[i]]) {
             fail(err, err_n, "assistant response contains an unexpected control token"); return -1;
         }
     memset(out, 0, sizeof *out); out->role = K3_CHAT_ASSISTANT;
-    out->reasoning_content = decode_ids(tok, ids, split);
-    out->content = decode_ids(tok, ids + split + na, end - (split + na));
-    if (!out->reasoning_content || !out->content) { k3_chat_message_free(out); fail(err, err_n, "out of memory decoding assistant output"); return -1; }
+    out->reasoning_content = o->thinking ? decode_ids(tok, ids, split) : NULL;
+    out->content = decode_ids(tok, ids + body, end - body);
+    if (!out->content || (o->thinking && !out->reasoning_content)) { k3_chat_message_free(out); fail(err, err_n, "out of memory decoding assistant output"); return -1; }
     return 0;
 }
