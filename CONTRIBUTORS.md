@@ -17,7 +17,8 @@ record.
 - **[sulfierry](https://github.com/sulfierry)** -- fixed the Hugging Face checkpoint
   download for the current `hf` CLI.
 - **[Barba2k2](https://github.com/Barba2k2)** -- overlapped trunk reads with layer
-  compute.
+  compute; made CI install the Python tool versions `pyproject.toml` already pins,
+  instead of whatever was newest that day.
 - **[ShaalanMarwan](https://github.com/ShaalanMarwan)** -- fixed the CMake build on
   ARM64/AArch64, where the x86-specific `-mavx2`/`-mfma` flags were applied
   unconditionally.
@@ -43,5 +44,13 @@ record.
   that actually builds and tests the CMake path (previously documented as
   interchangeable with Make but never verified in CI), and pinned Python tool
   dependencies in `pyproject.toml`.
+- **[cablepull](https://github.com/cablepull)** -- the parallel-chunked trunk reader
+  that takes the streamed trunk off queue depth 1; the `--stop-id` flag, with the
+  emit-time check that truncates a speculative sweep exactly like serial decode; and
+  running the incremental prefill on `--gen 0` so a fixed prefix can be warmed once and
+  resumed from a byte-exact state.
+- **[Avicennasis](https://github.com/Avicennasis)** -- hardened `--stop-id` parsing
+  against silent typos, added its `stopped_at` line to `k3_run.json` and a weightless
+  contract gate, and kept `k3_run.json` valid when `--gen 0` generates nothing.
 
 Thank you, all of you.
