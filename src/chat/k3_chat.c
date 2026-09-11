@@ -1,5 +1,6 @@
 /* k3_chat.c - transcript, XTML rendering, and assistant boundary parsing. */
 #define _POSIX_C_SOURCE 200809L
+#include "k3_portable_io.h"   /* fsync() shim for MinGW; see the header for why */
 #include "k3_chat.h"
 
 #include <errno.h>

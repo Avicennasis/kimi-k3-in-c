@@ -59,6 +59,7 @@
 #include <sys/resource.h>
 #endif
 
+#include "k3_portable_io.h"   /* getline() shim for MinGW; see the header for why */
 #include "k3.h"
 #include "k3_bind.h"
 #include "k3_cache.h"

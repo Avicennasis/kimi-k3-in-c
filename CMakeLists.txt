@@ -27,29 +27,8 @@ endif()
 option(K3_NATIVE_ARCH "Optimise for the building CPU (-march/-mcpu=native)" OFF)
 option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
 
+find_package(OpenMP)
 find_package(Threads REQUIRED)
-
-# Apple Clang does not search Homebrew's OpenMP runtime by itself. Mirror the Makefile:
-# discover an installed libomp explicitly, rather than treating a missing OpenMP package
-# as a reason to silently build a different execution configuration.
-if(APPLE)
-  set(K3_OMP_PREFIX "" CACHE PATH "Prefix containing libomp include/ and lib/")
-  if(NOT K3_OMP_PREFIX)
-    execute_process(COMMAND brew --prefix libomp
-                    OUTPUT_VARIABLE K3_OMP_PREFIX
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET)
-  endif()
-  if(K3_OMP_PREFIX)
-    find_path(K3_OMP_INCLUDE_DIR NAMES omp.h HINTS ${K3_OMP_PREFIX}/include)
-    find_library(K3_OMP_LIBRARY NAMES omp HINTS ${K3_OMP_PREFIX}/lib)
-  endif()
-  if(NOT K3_OMP_INCLUDE_DIR OR NOT K3_OMP_LIBRARY)
-    message(WARNING "Homebrew libomp was not found; install it with `brew install libomp` or configure -DK3_OMP_PREFIX=/path/to/libomp.")
-  endif()
-else()
-  find_package(OpenMP)
-endif()
 
 add_library(k3_flags INTERFACE)
 target_compile_options(k3_flags INTERFACE
@@ -95,6 +74,9 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
 target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
+if(OpenMP_C_FOUND)
+  target_link_libraries(k3 PUBLIC OpenMP::OpenMP_C)
+endif()
 
 # ------------------------------------------------------------------------------ cli --
 add_executable(k3_cli src/cli/k3_run.c)

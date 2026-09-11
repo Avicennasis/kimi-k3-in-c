@@ -29,6 +29,17 @@
  *                  _aligned_malloc, which takes its (size, align) arguments in the
  *                  opposite order.
  *
+ *   getline        POSIX.1-2008 line reader used by the chat REPL. Native on Linux and
+ *                  Darwin; absent from the MinGW runtime. Windows gets a small
+ *                  fgetc-based implementation with the same contract: it grows *lineptr
+ *                  with realloc, keeps the delimiter, and returns -1 on EOF with nothing
+ *                  read, so the REPL's `< 0` check ends the session the same way on
+ *                  every platform.
+ *
+ *   fsync          durability barrier the chat history writer uses before its atomic
+ *                  rename. Native on Linux and Darwin; Windows spells the same thing
+ *                  _commit(), which flushes the OS buffers for one CRT descriptor.
+ *
  * All four call sites fall back to buffered reads (or, for pread/posix_memalign, have
  * no fallback because the shim IS the implementation) when the direct path is
  * unavailable, so none of this changes what the engine computes, only how fast it
@@ -89,6 +100,7 @@ static inline int k3_set_direct(int fd)
 #include <windows.h>
 #include <io.h>
 #include <errno.h>
+#include <stdio.h>    /* FILE, fgetc: k3_getline below */
 #include <stdlib.h>
 #include <string.h>
 
@@ -189,6 +201,41 @@ static inline int posix_memalign(void **out, size_t align, size_t len)
  * two call sites that free a posix_memalign'd arena (k3_cache.c, k3_trunk.c) can free it
  * correctly on every platform without special-casing Windows at the call site itself. */
 #define k3_aligned_free(p) _aligned_free(p)
+
+/* getline(3) for MinGW, which ships no such symbol. Same contract as POSIX: *lineptr and
+ * *n describe a caller-owned buffer that this function may grow with realloc; the
+ * delimiter is kept; the return is the number of bytes read, or -1 at EOF with nothing
+ * read or on allocation failure. fgetc rather than fgets so an embedded NUL in the line
+ * cannot silently truncate the count. */
+static inline long long k3_getline(char **lineptr, size_t *n, FILE *stream)
+{
+    if (!lineptr || !n || !stream) { errno = EINVAL; return -1; }
+    if (!*lineptr || *n == 0) {
+        *n = 128;
+        *lineptr = (char *)malloc(*n);
+        if (!*lineptr) { errno = ENOMEM; return -1; }
+    }
+    size_t len = 0;
+    int c;
+    while ((c = fgetc(stream)) != EOF) {
+        if (len + 2 > *n) {
+            size_t cap = *n * 2;
+            char *grown = (char *)realloc(*lineptr, cap);
+            if (!grown) { errno = ENOMEM; return -1; }
+            *lineptr = grown; *n = cap;
+        }
+        (*lineptr)[len++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (len == 0 && c == EOF) return -1;
+    (*lineptr)[len] = '\0';
+    return (long long)len;
+}
+#define getline(lineptr, n, stream) k3_getline((lineptr), (n), (stream))
+
+/* fsync(2) for MinGW: _commit() flushes the OS write buffers for one CRT descriptor,
+ * which is the durability barrier the caller wants before its atomic rename. */
+#define fsync(fd) _commit(fd)
 
 /* madvise(MADV_HUGEPAGE) is a Linux transparent-hugepage hint; every caller already
  * treats it as advisory ("failure is not an error" -- k3_trunk.c), so a no-op is the
