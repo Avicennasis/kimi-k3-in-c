@@ -156,7 +156,11 @@ int64_t k3_uring_read(K3Uring *u, int fd, void *buf, int64_t nbytes, int64_t off
 {
     if (!u || nbytes <= 0) return 0;
 
-    const int64_t nchunk = (nbytes + K3_URING_CHUNK - 1) / K3_URING_CHUNK;
+    /* Quotient plus remainder rather than the (n + chunk - 1) / chunk round-up: the
+     * latter can overflow for a huge nbytes, and GCC's range analysis sees that and
+     * flags the malloc sizes below with -Walloc-size-larger-than under -O1. This form
+     * cannot overflow and is >= 1 for every nbytes > 0. */
+    const int64_t nchunk = nbytes / K3_URING_CHUNK + (nbytes % K3_URING_CHUNK != 0);
     Chunk *ck = (Chunk *)malloc((size_t)nchunk * sizeof(Chunk));
     if (!ck) return -1;
     for (int64_t i = 0; i < nchunk; i++) {
