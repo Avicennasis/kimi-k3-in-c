@@ -40,6 +40,11 @@
  *                  rename. Native on Linux and Darwin; Windows spells the same thing
  *                  _commit(), which flushes the OS buffers for one CRT descriptor.
  *
+ *   rename         the atomic replace itself. POSIX rename() overwrites an existing
+ *                  destination; the CRT's does not, so every history save after the
+ *                  first failed on Windows. Windows gets MoveFileEx with
+ *                  MOVEFILE_REPLACE_EXISTING, which has the POSIX semantics.
+ *
  * All four call sites fall back to buffered reads (or, for pread/posix_memalign, have
  * no fallback because the shim IS the implementation) when the direct path is
  * unavailable, so none of this changes what the engine computes, only how fast it
@@ -236,6 +241,27 @@ static inline long long k3_getline(char **lineptr, size_t *n, FILE *stream)
 /* fsync(2) for MinGW: _commit() flushes the OS write buffers for one CRT descriptor,
  * which is the durability barrier the caller wants before its atomic rename. */
 #define fsync(fd) _commit(fd)
+
+/* rename(2) for MinGW. POSIX rename replaces an existing destination atomically, and
+ * the chat history writer depends on exactly that: every save after the first renames
+ * a fresh temp file over the transcript it is replacing. The CRT's rename() is
+ * MoveFile(), which refuses an existing destination with EEXIST, so on Windows the
+ * second save of a session failed and the transcript was never updated (caught by
+ * test_chat's "atomic JSONL history write", whose destination pre-exists). MoveFileEx
+ * with MOVEFILE_REPLACE_EXISTING is the documented replace-in-place, and
+ * MOVEFILE_WRITE_THROUGH makes it return only once the change is on disk, which is
+ * the same durability the fsync above bought for the data. */
+static inline int k3_win_rename(const char *from, const char *to)
+{
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+    switch (GetLastError()) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
+    case ERROR_ACCESS_DENIED:  case ERROR_SHARING_VIOLATION: errno = EACCES; break;
+    default: errno = EIO; break;
+    }
+    return -1;
+}
+#define rename(from, to) k3_win_rename((from), (to))
 
 /* madvise(MADV_HUGEPAGE) is a Linux transparent-hugepage hint; every caller already
  * treats it as advisory ("failure is not an error" -- k3_trunk.c), so a no-op is the
