@@ -89,6 +89,10 @@ target_include_directories(k3_chat PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/chat
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+# k3_chat.c includes k3_portable_io.h for the fsync/rename shims its history writer
+# uses on Windows. The Makefile passes -Isrc/io to everything; here only this target
+# needs it, and privately, so the chat library's public surface stays src/chat.
+target_include_directories(k3_chat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/io)
 target_link_libraries(k3_chat PUBLIC k3_flags m)
 target_link_libraries(k3_cli PRIVATE k3 k3_chat)
 
@@ -129,6 +133,9 @@ add_test(NAME chat_template
          COMMAND ${CMAKE_COMMAND}
                  -DTEST_CHAT=$<TARGET_FILE:test_chat>
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_chat_test.cmake)
+# Same contract as the tokenizer entry below: without this property a "SKIPPED:" run is
+# recorded as a pass, and a gate that cannot fail is worse than one that is absent.
+set_tests_properties(chat_template PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 
 # The negative half of the config contract. Each fixture is the working flat config with
 # exactly one field mutated, so a rejection can only come from that field. Without these
