@@ -68,6 +68,7 @@
 #include "k3_chat.h"
 #include "k3_sampler.h"
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_cancel.h" /* first Ctrl-C stops at a safe point; see the header */
 
 static double now_s(void)
 {
@@ -1769,12 +1770,26 @@ int main(int argc, char **argv)
      * figure against a single step would misstate the I/O share. */
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0, expert_bytes_total = 0;
+    /* From here on the first Ctrl-C is a request to stop at the next safe point, not a
+     * kill: the step in flight completes, then --save-state, --out and the reports run
+     * exactly as for a finished run, and the exit code is 5. Armed only now, so a
+     * Ctrl-C during the minutes of weight loading above still kills at once. */
+    k3_cancel_install();
+    int interrupted = 0;
     /* `nout < gen` drives generation; the `g == 0` disjunct additionally runs the
      * incremental prefill once even when --gen 0, so the prompt's KV and recurrent
      * state are computed and can be saved with ZERO generated tokens. That is what
      * lets --gen 0 --save-state warm a reusable prefix (e.g. a chat system prompt)
      * whose recurrent state is exact rather than one generated token past the end. */
     for (int g = 0; nout < gen || (incremental && g == 0); g++) {
+        if (k3_cancel_requested()) {
+            /* Checked at the top, so the step that was in flight when the signal
+             * arrived has finished and its KV rows and recurrent state are exact. */
+            interrupted = 1;
+            printf("interrupted: %d of %d tokens generated; state, results and reports "
+                   "follow as for a finished run\n", nout, gen);
+            break;
+        }
         k3_cache_reset_stats(&cache);
         const double ts = now_s();
         int frc;
@@ -2019,14 +2034,14 @@ int main(int argc, char **argv)
                 "\"seconds_per_token\":%.4f,\"expert_bytes_read\":%llu,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
-                "\"stopped_at\":%d,"
+                "\"stopped_at\":%d,\"interrupted\":%s,"
                 "\"generated_text\":",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
                 nout ? t_total / nout : 0.0, (unsigned long long)expert_bytes_total,
                 (unsigned long long)(w.trunk ? w.trunk->bytes_read : 0),
                 (unsigned long long)w.ms.embed_bytes_read,
                 (unsigned long long)w.ms.lm_head_bytes_read,
-                w.ultra ? "true" : "false", stopped_at);
+                w.ultra ? "true" : "false", stopped_at, interrupted ? "true" : "false");
         json_string(f, generated_text);
         fputs("}\n", f);
         fclose(f);
@@ -2108,5 +2123,8 @@ int main(int argc, char **argv)
         return 4;
     }
     if (out_fail) return 3;
+    /* Everything above ran, so the state and results on disk are complete; the code
+     * says the token list is shorter than asked for. */
+    if (interrupted) return 5;
     return 0;
 }

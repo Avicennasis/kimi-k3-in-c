@@ -156,7 +156,7 @@ CHAT_SRC   := src/chat/k3_chat.c src/chat/k3_sampler.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok test_chat scale_test k3_model test_trunk test_st_faults
+UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok test_chat scale_test k3_model test_trunk test_st_faults test_cancel
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -216,6 +216,10 @@ $(BIN)/test_chat: tests/unit/test_chat.c src/chat/k3_chat.c src/chat/k3_sampler.
 $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
 
+# Signal handling only; no OpenMP, no platform calls beyond signal() and write().
+$(BIN)/test_cancel: tests/unit/test_cancel.c src/cli/k3_cancel.h | $(BIN)
+	$(CC) -O2 -std=gnu99 $(WARN) $(INCLUDES) -Isrc/cli $< -o $@
+
 # Allocates at REAL model widths (a ~1.8 GB KDA layer), so it needs the optimised build
 # rather than the portable C99 one the tokenizer and config tests use.
 $(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o | $(BIN)
@@ -260,6 +264,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	@echo "== model streaming ==";   ./$(BIN)/test_model_stream $(FIXTURES)/st
 	@echo "== shard faults ==";     ./$(BIN)/test_st_faults $(FIXTURES)/st $(BUILD)/stfault
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
+	@echo "== interrupt contract =="; ./$(BIN)/test_cancel
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \
 	      ./$(BIN)/test_cfg reject $(FIXTURES)/cfg/$$f.json || exit 1; \
