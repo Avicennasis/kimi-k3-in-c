@@ -77,7 +77,9 @@ typedef struct {
 /* Open every *.safetensors in dir and index every tensor. Returns 0 on success. A
  * directory whose filenames declare more shards than are present still opens (a subset
  * is a legitimate thing to inspect) but says so on stderr, and every later miss is
- * explained by k3_st_explain_missing. */
+ * explained by k3_st_explain_missing. A name present in two shards is resolved by
+ * model.safetensors.index.json (an overlay shard next to the base shards) and refused
+ * when there is no index, the index does not list it, or it maps to a third file. */
 int  k3_st_open(K3St *s, const char *dir);
 void k3_st_close(K3St *s);
 

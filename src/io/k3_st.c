@@ -42,6 +42,8 @@ struct K3StIndex {
     jval *map;                /* the "weight_map" object, or NULL                   */
 };
 
+static const char *index_shard(const K3St *s, const char *name, int *listed);
+
 static const char *base_name_(const char *p)
 {
     const char *b = strrchr(p, '/');
@@ -547,17 +549,68 @@ int k3_st_open(K3St *s, const char *dir)
     if (!s->bucket) { k3_st_close(s); return -1; }
     memset(s->bucket, 0xFF, (size_t)nb * sizeof(int32_t));   /* -1 */
 
+    /* A name in two shards used to be an unconditional refusal. That is right when
+     * nothing says which bytes the name should resolve to, and wrong for a checkpoint
+     * distributed with an OVERLAY shard (a fine-tune that ships only the tensors it
+     * changed, next to the base shards): there the checkpoint's own
+     * model.safetensors.index.json names the authoritative copy, transformers honours
+     * it, and refusing made the directory unloadable without rewriting shards. So the
+     * index arbitrates -- read lazily, only when a duplicate is actually seen -- and
+     * the refusal stays for every case it cannot decide: no index, a name it does not
+     * list, or a mapping to a third file. The losing copy is dropped from the table
+     * before the hash is built, so s->t holds exactly one entry per name. */
+    int n_overlay = 0;
     for (int i = 0; i < s->nt; i++) {
         uint64_t h = fnv1a(s->t[i].name);
         int j = (int)(h & (uint64_t)(nb - 1));
         while (s->bucket[j] >= 0) {
-            if (!strcmp(s->t[s->bucket[j]].name, s->t[i].name)) {
-                fprintf(stderr, "k3_st: duplicate tensor name %s\n", s->t[i].name);
-                k3_st_close(s); return -1;
+            const int prev = s->bucket[j];
+            if (!strcmp(s->t[prev].name, s->t[i].name)) {
+                int listed = 0;
+                const char *auth = index_shard(s, s->t[i].name, &listed);
+                const char *here = base_name_(s->path[s->t[i].shard]);
+                const char *was  = base_name_(s->path[s->t[prev].shard]);
+                if (auth && !strcmp(auth, here)) {
+                    s->t[prev].shard = -1;          /* the new copy wins; drop the old */
+                    s->bucket[j] = i;
+                } else if (auth && !strcmp(auth, was)) {
+                    s->t[i].shard = -1;             /* the old copy stays; drop this one */
+                } else {
+                    fprintf(stderr, "k3_st: duplicate tensor name %s: in %s and %s; %s\n",
+                            s->t[i].name, was, here,
+                            (s->ix && s->ix->map)
+                                ? (auth ? "model.safetensors.index.json maps it to a third "
+                                          "file, so the index and the shards disagree"
+                                        : "model.safetensors.index.json does not list it, "
+                                          "so nothing says which copy is authoritative")
+                                : "there is no model.safetensors.index.json here to say "
+                                  "which copy is authoritative");
+                    k3_st_close(s); return -1;
+                }
+                n_overlay++;
+                break;
             }
             j = (j + 1) & (nb - 1);
         }
-        s->bucket[j] = i;
+        if (s->bucket[j] < 0) s->bucket[j] = i;
+    }
+    if (n_overlay) {
+        /* Compact out the dropped copies and rebuild the hash over what remains. Names
+         * live in the string pool, so the entries move but the pointers stay valid. */
+        int keep = 0;
+        for (int i = 0; i < s->nt; i++)
+            if (s->t[i].shard >= 0) s->t[keep++] = s->t[i];
+        s->nt = keep;
+        memset(s->bucket, 0xFF, (size_t)nb * sizeof(int32_t));
+        for (int i = 0; i < s->nt; i++) {
+            uint64_t h = fnv1a(s->t[i].name);
+            int j = (int)(h & (uint64_t)(nb - 1));
+            while (s->bucket[j] >= 0) j = (j + 1) & (nb - 1);
+            s->bucket[j] = i;
+        }
+        fprintf(stderr, "k3_st: note: %d tensor name(s) present in two shards, resolved by "
+                        "model.safetensors.index.json (the copy it maps each name to is "
+                        "read, the other ignored)\n", n_overlay);
     }
     return 0;
 }

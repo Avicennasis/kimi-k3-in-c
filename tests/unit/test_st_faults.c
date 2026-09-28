@@ -146,6 +146,28 @@ static int write_text(const char *dir, const char *file, const char *text)
     return writeall(p, (const unsigned char *)text, strlen(text));
 }
 
+/* A one-tensor shard: [8-byte LE header length][header JSON][data]. Used to overlay a
+ * name the fixture already has, with bytes that cannot be confused with the original. */
+static int write_overlay(const char *dir, const char *file, const char *name,
+                         const unsigned char *data, size_t n)
+{
+    char hdr[512];
+    const int hl = snprintf(hdr, sizeof hdr,
+                            "{\"%s\":{\"dtype\":\"F32\",\"shape\":[%zu],\"data_offsets\":[0,%zu]}}",
+                            name, n / 4, n);
+    if (hl <= 0 || hl >= (int)sizeof hdr) return -1;
+    char p[2048];
+    if (snprintf(p, sizeof p, "%s/%s", dir, file) >= (int)sizeof p) return -1;
+    FILE *f = fopen(p, "wb");
+    if (!f) return -1;
+    unsigned char le[8];
+    for (int i = 0; i < 8; i++) le[i] = (unsigned char)(((uint64_t)hl >> (8 * i)) & 0xFF);
+    const int ok = fwrite(le, 1, 8, f) == 8 && fwrite(hdr, 1, (size_t)hl, f) == (size_t)hl
+                && fwrite(data, 1, n, f) == n;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
 static uint64_t rdle64(const unsigned char *b)
 {
     uint64_t v = 0;
@@ -374,6 +396,102 @@ int main(int argc, char **argv)
            && strstr(why, "2 of 2 declared shards are here") != NULL,
            "complete shard set: the name never existed", why);
         if (ok) k3_st_close(&s);
+    }
+
+    /* ---- duplicate names: the index arbitrates, nothing else does ----
+     * overlay.safetensors re-declares plain.f32.2d (256 floats in the fixture) with
+     * every float set to 1.0. Which copy k3_st_find returns is then visible in the
+     * bytes, not just in the shard number. */
+    {
+        static float ones[256];
+        for (int i = 0; i < 256; i++) ones[i] = 1.0f;
+        const unsigned char *ov = (const unsigned char *)ones;
+        int nt_ctl = 0;
+        { K3St s; if (k3_st_open(&s, fix) == 0) { nt_ctl = s.nt; k3_st_close(&s); } }
+
+        /* T10: no index -> refused, as before */
+        {
+            char d[1024];
+            snprintf(d, sizeof d, "%s/t10", work);
+            K3St s; memset(&s, 0, sizeof s);
+            const int built = copy_shards(fix, d, NULL) == 0
+                           && write_overlay(d, "overlay.safetensors", "plain.f32.2d", ov, sizeof ones) == 0;
+            const int rc = built ? k3_st_open(&s, d) : 0;
+            ck(built && rc != 0, "duplicate without an index refused", "");
+            if (rc == 0 && built) k3_st_close(&s);
+        }
+        /* T11: the index maps the name to the overlay -> the overlay's bytes are read */
+        {
+            char d[1024];
+            snprintf(d, sizeof d, "%s/t11", work);
+            K3St s; memset(&s, 0, sizeof s);
+            const int built = copy_shards(fix, d, NULL) == 0
+                           && write_overlay(d, "overlay.safetensors", "plain.f32.2d", ov, sizeof ones) == 0
+                           && write_text(d, "model.safetensors.index.json",
+                                         "{\"weight_map\":{\"plain.f32.2d\":\"overlay.safetensors\"}}") == 0;
+            const int rc = built ? k3_st_open(&s, d) : -99;
+            float got[256]; memset(got, 0, sizeof got);
+            const K3Tensor *t = rc == 0 ? k3_st_find(&s, "plain.f32.2d") : NULL;
+            int overlay_shard = 0, all_ones = 1;
+            if (t) {
+                overlay_shard = endswith(s.path[t->shard], "overlay.safetensors");
+                if (t->nbytes == (int64_t)sizeof got && k3_st_read(&s, t, got) == (int64_t)sizeof got) {
+                    for (int i = 0; i < 256; i++) if (got[i] != 1.0f) all_ones = 0;
+                } else all_ones = 0;
+            }
+            ck(rc == 0 && s.nt == nt_ctl, "index -> overlay: opens with one entry per name", "");
+            ck(t && overlay_shard && all_ones, "index -> overlay: the overlay's bytes are read", "");
+            ck(rc == 0 && k3_st_find(&s, "plain.bf16.1d") != NULL, "index -> overlay: base tensors still resolve", "");
+            if (rc == 0) k3_st_close(&s);
+        }
+        /* T12: the index maps the name to the BASE shard -> the original bytes are read */
+        {
+            char d[1024];
+            snprintf(d, sizeof d, "%s/t12", work);
+            K3St s; memset(&s, 0, sizeof s);
+            const int built = copy_shards(fix, d, NULL) == 0
+                           && write_overlay(d, "overlay.safetensors", "plain.f32.2d", ov, sizeof ones) == 0
+                           && write_text(d, "model.safetensors.index.json",
+                                         "{\"weight_map\":{\"plain.f32.2d\":\"model-00001-of-00002.safetensors\"}}") == 0;
+            const int rc = built ? k3_st_open(&s, d) : -99;
+            float got[256]; memset(got, 0, sizeof got);
+            const K3Tensor *t = rc == 0 ? k3_st_find(&s, "plain.f32.2d") : NULL;
+            int base_shard = 0, any_not_one = 0;
+            if (t) {
+                base_shard = endswith(s.path[t->shard], "model-00001-of-00002.safetensors");
+                if (t->nbytes == (int64_t)sizeof got && k3_st_read(&s, t, got) == (int64_t)sizeof got)
+                    for (int i = 0; i < 256; i++) if (got[i] != 1.0f) any_not_one = 1;
+            }
+            ck(rc == 0 && s.nt == nt_ctl && t && base_shard && any_not_one,
+               "index -> base: the base shard's bytes are read", "");
+            if (rc == 0) k3_st_close(&s);
+        }
+        /* T13: the index maps the name to a third file -> refused */
+        {
+            char d[1024];
+            snprintf(d, sizeof d, "%s/t13", work);
+            K3St s; memset(&s, 0, sizeof s);
+            const int built = copy_shards(fix, d, NULL) == 0
+                           && write_overlay(d, "overlay.safetensors", "plain.f32.2d", ov, sizeof ones) == 0
+                           && write_text(d, "model.safetensors.index.json",
+                                         "{\"weight_map\":{\"plain.f32.2d\":\"elsewhere.safetensors\"}}") == 0;
+            const int rc = built ? k3_st_open(&s, d) : 0;
+            ck(built && rc != 0, "index -> a third file refused", "");
+            if (rc == 0 && built) k3_st_close(&s);
+        }
+        /* T14: the index does not list the name -> refused */
+        {
+            char d[1024];
+            snprintf(d, sizeof d, "%s/t14", work);
+            K3St s; memset(&s, 0, sizeof s);
+            const int built = copy_shards(fix, d, NULL) == 0
+                           && write_overlay(d, "overlay.safetensors", "plain.f32.2d", ov, sizeof ones) == 0
+                           && write_text(d, "model.safetensors.index.json",
+                                         "{\"weight_map\":{\"plain.bf16.1d\":\"model-00001-of-00002.safetensors\"}}") == 0;
+            const int rc = built ? k3_st_open(&s, d) : 0;
+            ck(built && rc != 0, "index without the name refused", "");
+            if (rc == 0 && built) k3_st_close(&s);
+        }
     }
 
     printf("\n%s\n", g_fail ? "ST-FAULT TESTS FAILED" : "ST-FAULT TESTS PASSED");
