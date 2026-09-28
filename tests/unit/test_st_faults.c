@@ -118,6 +118,46 @@ static uint64_t rdle64(const unsigned char *b)
     return v;
 }
 
+/* A shard built from scratch: [8-byte LE header length][json][data]. The cases
+ * below need headers whose data_offsets the fixture generator would never
+ * write (it lays tensors out back to back), so they are spelled out by hand. */
+static int write_synthetic_shard(const char *path, const char *header_json,
+                                 const unsigned char *data, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const uint64_t hlen = (uint64_t)strlen(header_json);
+    unsigned char le[8];
+    for (int i = 0; i < 8; i++) le[i] = (unsigned char)(hlen >> (8 * i));
+    int ok = fwrite(le, 1, 8, f) == 8
+          && fwrite(header_json, 1, (size_t)hlen, f) == (size_t)hlen
+          && (n == 0 || fwrite(data, 1, n, f) == n);
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+/* One synthetic shard alone in its own directory; returns k3_st_open's rc and
+ * the tensor count through *nt (only meaningful when rc == 0). */
+static int open_synthetic(const char *work, const char *sub, const char *header_json,
+                          size_t data_bytes, int *nt)
+{
+    char d[1024], p[2048];
+    unsigned char *data = (unsigned char *)calloc(data_bytes ? data_bytes : 1, 1);
+    if (!data) return -99;
+    for (size_t i = 0; i < data_bytes; i++) data[i] = (unsigned char)i;
+    snprintf(d, sizeof d, "%s/%s", work, sub);
+    mkdir(d, 0755);
+    snprintf(p, sizeof p, "%s/model-00001-of-00001.safetensors", d);
+    const int wrc = write_synthetic_shard(p, header_json, data, data_bytes);
+    free(data);
+    if (wrc != 0) return -99;
+    K3St s;
+    memset(&s, 0, sizeof s);
+    const int rc = k3_st_open(&s, d);
+    if (rc == 0) { *nt = s.nt; k3_st_close(&s); }
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -249,6 +289,38 @@ int main(int argc, char **argv)
         /* Either refusal at open or a short read: both are loud. Full counts
          * over a truncated file would be silent corruption. */
         ck(ok && (rc != 0 || shortread), "tail-truncated data surfaces loudly", "");
+    }
+
+    /* T5-T8: the data region must be tiled exactly. The reference implementation
+     * sorts entries by data_offsets and requires each start to equal the previous
+     * end, from 0. Two tensors claiming one span (T5) means one of them reads the
+     * other's bytes and the shape/size check on each passes on its own; a span no
+     * tensor claims (T6, T7) means the header and the file disagree about where the
+     * data is. Both read back full and silent without this sweep. T8 is the
+     * control: a contiguous layout with a zero-length tensor in the middle, which
+     * the fixture set (empty.f32) says is legal. */
+    {
+        int nt = 0, rc;
+        rc = open_synthetic(work, "t5",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]},"
+             "\"b\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[8,24]}}", 24, &nt);
+        ck(rc != 0 && rc != -99, "overlapping spans refused", rc == -99 ? "harness" : "");
+
+        rc = open_synthetic(work, "t6",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]},"
+             "\"b\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[24,40]}}", 40, &nt);
+        ck(rc != 0 && rc != -99, "gap between spans refused", rc == -99 ? "harness" : "");
+
+        rc = open_synthetic(work, "t7",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[8,24]}}", 24, &nt);
+        ck(rc != 0 && rc != -99, "first span not at offset 0 refused", rc == -99 ? "harness" : "");
+
+        rc = open_synthetic(work, "t8",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]},"
+             "\"z\":{\"dtype\":\"F32\",\"shape\":[0,8],\"data_offsets\":[16,16]},"
+             "\"b\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[16,32]}}", 32, &nt);
+        ck(rc == 0 && nt == 3, "contiguous + zero-length tensor opens",
+           rc == -99 ? "harness" : (rc != 0 ? "refused" : (nt != 3 ? "wrong tensor count" : "")));
     }
 
     printf("\n%s\n", g_fail ? "ST-FAULT TESTS FAILED" : "ST-FAULT TESTS PASSED");

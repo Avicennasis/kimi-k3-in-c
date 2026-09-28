@@ -209,6 +209,59 @@ static int push(Build *b, K3St *s, const char *name, size_t nlen, const K3Tensor
     return 0;
 }
 
+/* ------------------------------------------------------------------ span sweep */
+
+typedef struct { int64_t o0, o1; size_t idx; } Span;
+
+static int cmp_span(const void *a, const void *b)
+{
+    const Span *x = (const Span *)a, *y = (const Span *)b;
+    if (x->o0 != y->o0) return x->o0 < y->o0 ? -1 : 1;
+    if (x->o1 != y->o1) return x->o1 < y->o1 ? -1 : 1;
+    return 0;
+}
+
+/* Walk one shard's spans in offset order with a cursor from 0. Every span must start
+ * exactly where the previous one ended: a start below the cursor is an overlap, a
+ * start above it is a gap. A zero-length span (shape with a 0 in it) is legal wherever
+ * its start meets the cursor. O(n log n) for the ~5,404 tensors a real shard holds. */
+static int sweep_spans(const K3St *s, const Build *b, size_t first_idx, int64_t base,
+                       const char *path)
+{
+    const size_t n = b->n - first_idx;
+    if (n == 0) return 0;
+    Span *sp = (Span *)malloc(n * sizeof *sp);
+    if (!sp) { fprintf(stderr, "k3_st: out of memory\n"); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        const K3Tensor *t = &b->t[first_idx + i];
+        sp[i].o0 = t->off - base;
+        sp[i].o1 = sp[i].o0 + t->nbytes;
+        sp[i].idx = first_idx + i;
+    }
+    qsort(sp, n, sizeof *sp, cmp_span);
+    int64_t cursor = 0;
+    size_t prev = 0;                     /* index into sp of the span that set cursor */
+    for (size_t i = 0; i < n; i++) {
+        const char *nm = s->strpool + b->noff[sp[i].idx];
+        if (sp[i].o0 < cursor) {
+            const char *pm = s->strpool + b->noff[sp[prev].idx];
+            fprintf(stderr, "k3_st: %s: %s [%lld,%lld) overlaps %s [%lld,%lld)\n",
+                    path, nm, (long long)sp[i].o0, (long long)sp[i].o1,
+                    pm, (long long)sp[prev].o0, (long long)sp[prev].o1);
+            free(sp); return -1;
+        }
+        if (sp[i].o0 > cursor) {
+            fprintf(stderr, "k3_st: %s: %lld bytes at offset %lld belong to no tensor "
+                            "(gap before %s)\n",
+                    path, (long long)(sp[i].o0 - cursor), (long long)cursor, nm);
+            free(sp); return -1;
+        }
+        if (sp[i].o1 > cursor) { cursor = sp[i].o1; prev = i; }
+    }
+    free(sp);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ one shard */
 
 static int scan_shard(K3St *s, Build *b, int shard, const char *path)
@@ -260,6 +313,7 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     static char name[512];
     int first = 1, ntensor = 0;
     int64_t maxend = 0;
+    const size_t first_idx = b->n;       /* this shard's entries are b->t[first_idx..) */
     for (;;) {
         ws(&sc);
         if (sc.p < sc.end && *sc.p == '}') { sc.p++; break; }
@@ -369,6 +423,15 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
         if (push(b, s, name, nlen, &t) != 0) { fprintf(stderr, "k3_st: out of memory\n"); goto bad; }
         ntensor++;
     }
+
+    /* The spans must tile the data region exactly. Each entry above was checked on its
+     * own (in range, size matches shape), but nothing so far relates them to each
+     * other: two tensors claiming one span both pass, and one of them then reads the
+     * other's bytes as plausible numbers; a span no tensor claims means the header and
+     * the file disagree about where the data is. The reference implementation sorts
+     * by data_offsets and requires each start to equal the previous end, from 0, so
+     * both are refusals there. Trailing bytes stay a note, as before. */
+    if (sweep_spans(s, b, first_idx, base, path) != 0) goto bad;
 
     if (base + maxend != fsize)
         fprintf(stderr, "k3_st: note: %s has %lld trailing bytes after the last tensor\n",
