@@ -22,12 +22,16 @@
 #ifndef K3_STATE_H
 #define K3_STATE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "k3.h"
 
 #define K3_STATE_MAGIC "K3ST"
-#define K3_STATE_VER   1
+/* Version 2 adds payload_hash. A version 1 file is refused rather than read with a
+ * guessed layout; state files are session artifacts, written and read by the same
+ * binary within one conversation, not a long-lived format. */
+#define K3_STATE_VER   2
 
 typedef struct {
     char    magic[4];
@@ -36,7 +40,14 @@ typedef struct {
     int32_t n_bound, n_mla, cached, nseq;
     int64_t kper;          /* KDA+conv floats per layer */
     int64_t kvpp, ropepp;  /* KV / rope floats per position, per MLA layer */
+    /* k3_state_hash over the payload bytes in file order: seq, ks, then the KV and
+     * rope slices. Checked on load; a file whose every fread comes back full can still
+     * hold a damaged matrix, and this is the only check that sees it. */
+    uint64_t payload_hash;
 } K3StateHdr;
+
+#define K3_STATE_HASH_INIT 0xcbf29ce484222325ULL   /* FNV-1a offset basis */
+uint64_t k3_state_hash(uint64_t h, const void *p, size_t n);
 
 void k3_state_fp(const K3Cfg *c, int32_t *fp);
 

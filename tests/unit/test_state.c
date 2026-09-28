@@ -20,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "k3_state.h"
 
@@ -205,6 +210,125 @@ int main(int argc, char **argv)
                          N_BOUND, N_MLA, CACHED - 1) != 0, "cache too small refused", NULL);
         arrays_free(&dst);
     }
+    printf("state file: payload integrity\n");
+    {
+        /* One flipped byte in each region. Structure intact, every fread full: this is
+         * exactly the damage a length check cannot see, and a restore from it decodes
+         * fluent, wrong tokens. */
+        const size_t H = sizeof(K3StateHdr);
+        const size_t off_seq   = H;
+        const size_t off_ks    = off_seq + (size_t)NSEQ * sizeof(int);
+        const size_t off_kvc   = off_ks + (size_t)KPER * N_BOUND * sizeof(float);
+        const size_t off_ropec = off_kvc + (size_t)N_MLA * CACHED * src.kvpp * sizeof(float);
+        const struct { const char *name; size_t at; } flips[] = {
+            { "flipped byte in the token ids refused", off_seq + 5 },
+            { "flipped byte in the recurrent state refused", off_ks + 333 },
+            { "flipped byte in the KV cache refused", off_kvc + 77 },
+            { "flipped byte in the rope rows refused", off_ropec + 1 },
+            { "flipped byte in the last payload byte refused", n - 1 },
+        };
+        unsigned char *m = (unsigned char *)malloc(n);
+        Arrays dst; arrays_alloc(&dst, KV_CAP, &c);
+        for (size_t i = 0; i < sizeof flips / sizeof flips[0]; i++) {
+            memcpy(m, img, n);
+            m[flips[i].at] ^= 0x01;
+            spit(mut, m, n);
+            char d[64]; snprintf(d, sizeof d, "byte %zu of %zu", flips[i].at, n);
+            ck(load(mut, &c, &dst) != 0, flips[i].name, d);
+        }
+        /* The other direction: a good payload under a header whose hash was damaged. */
+        memcpy(m, img, n);
+        m[H - 1] ^= 0x01;
+        spit(mut, m, n);
+        ck(load(mut, &c, &dst) != 0, "damaged header hash refused", NULL);
+        /* And the untouched file still loads, so the refusals above are the flips. */
+        ck(load(good, &c, &dst) == 0, "untouched file still loads", NULL);
+        free(m);
+        arrays_free(&dst);
+    }
+    {
+        /* Not a gate, a number: the hash runs once per save and once per load over a
+         * payload that is 0.63 GB of recurrent state plus the KV cache at full scale. */
+        const size_t nb = (size_t)64 << 20;
+        unsigned char *buf = (unsigned char *)malloc(nb);
+        for (size_t i = 0; i < nb; i++) buf[i] = (unsigned char)(i * 2654435761u >> 24);
+        const clock_t t0 = clock();
+        const uint64_t h = k3_state_hash(K3_STATE_HASH_INIT, buf, nb);
+        const double s = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        printf("  INFO  hash of %zu MB: %016llx in %.3f s (%.0f MB/s)\n",
+               nb >> 20, (unsigned long long)h, s, s > 0 ? (double)(nb >> 20) / s : 0.0);
+        ck(k3_state_hash(K3_STATE_HASH_INIT, buf, nb) == h, "hash is deterministic", NULL);
+        buf[nb / 2] ^= 0x80;
+        ck(k3_state_hash(K3_STATE_HASH_INIT, buf, nb) != h, "hash sees one flipped bit", NULL);
+        free(buf);
+    }
+
+    printf("state file: publication\n");
+    {
+        /* Publish by rename, so the destination never holds a half-written state: a
+         * crash mid-save leaves the previous file, not a truncated one. The observable
+         * on POSIX is the inode: a rename installs a new file, an in-place rewrite keeps
+         * the old one. */
+#ifndef _WIN32
+        struct stat before, after;
+        ck(stat(good, &before) == 0, "stat before re-save", NULL);
+        ck(save(good, &c, &src) == 0, "re-save over an existing file", NULL);
+        ck(stat(good, &after) == 0, "stat after re-save", NULL);
+        ck(before.st_ino != after.st_ino, "destination is a new inode (rename)", NULL);
+        /* mkstemp creates 0600; the writer must hand the file back at the mode a plain
+         * fopen would have given it, or a state saved by one user stops being readable
+         * by the group that could read it before. */
+        {
+            const mode_t um = umask(0); umask(um);
+            const mode_t want = 0666 & ~um, got = after.st_mode & 0777;
+            char d[48]; snprintf(d, sizeof d, "mode %04o, want %04o (umask %04o)", (unsigned)got, (unsigned)want, (unsigned)um);
+            ck(got == want, "published mode is fopen's, not mkstemp's", d);
+        }
+#else
+        ck(save(good, &c, &src) == 0, "re-save over an existing file", NULL);
+        printf("  SKIP  %-40s %s\n", "destination is a new inode (rename)", "no inode on Windows");
+#endif
+        /* Nothing staged is left behind. */
+        int residue = 0;
+        DIR *d = opendir(work);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL)
+                if (strstr(e->d_name, ".tmp")) { residue++; printf("        leftover: %s\n", e->d_name); }
+            closedir(d);
+        }
+        ck(d != NULL && residue == 0, "no temp file left after a save", NULL);
+    }
+#ifndef _WIN32
+    {
+        /* A save that cannot stage its temp file must fail without touching the old
+         * file. Directory write permission is what mkstemp needs and what an in-place
+         * fopen(path, "wb") does not, so this is the difference between the two. */
+        char rodir[4096], ro[4096];
+        snprintf(rodir, sizeof rodir, "%s/ro", work);
+        snprintf(ro, sizeof ro, "%s/ro/state.k3st", work);
+        mkdir(rodir, 0755);
+        chmod(rodir, 0755);
+        ck(save(ro, &c, &src) == 0, "save into a writable directory", NULL);
+        size_t n0 = 0; unsigned char *img0 = slurp(ro, &n0);
+        Arrays other; arrays_alloc(&other, KV_CAP, &c); arrays_pattern(&other);
+        other.seq[0] ^= 0x7F;   /* a different payload, so an in-place rewrite would show */
+        if (chmod(rodir, 0555) == 0 && access(rodir, W_OK) != 0) {
+            const int rc = save(ro, &c, &other);
+            size_t n1 = 0; unsigned char *img1 = slurp(ro, &n1);
+            ck(rc != 0, "save with no room to stage fails", NULL);
+            ck(img0 && img1 && n0 == n1 && memcmp(img0, img1, n0) == 0,
+               "and the old file is byte-identical", NULL);
+            free(img1);
+        } else {
+            printf("  SKIP  %-40s %s\n", "save with no room to stage fails",
+                   "directory stayed writable (running as root?)");
+        }
+        chmod(rodir, 0755);
+        free(img0);
+        arrays_free(&other);
+    }
+#endif
     free(img);
     arrays_free(&src);
 
