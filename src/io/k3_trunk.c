@@ -19,6 +19,7 @@
 #include "json.h"
 #include "k3_st.h"
 #include "k3_trunk.h"
+#include "k3_uring.h"
 
 static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
 
@@ -48,7 +49,6 @@ static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
  * and the main thread can both have a transfer in flight.
  */
 #define K3_TRUNK_MAXRING 8
-#define K3_TRUNK_CHUNK ((int64_t)64 << 20)   /* per-request read size; see load_run_to */
 
 typedef struct {
     pthread_t thread;
@@ -63,6 +63,7 @@ typedef struct {
     int       nq;
     int       pending[K3_TRUNK_MAXRING];/* [slot] layer being read, or -1 */
     int       held;                     /* slot the caller is using, or -1 */
+    K3Uring  *ur;                       /* the worker's own ring          */
 } K3TrunkIO;
 
 static void *trunk_io_main(void *arg);
@@ -428,9 +429,14 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         pthread_cond_init(&io->cv_work, NULL);
         pthread_cond_init(&io->cv_done, NULL);
         tr->io_state = io;
+        /* One ring per reading thread: an io_uring is not safe to drive from two
+         * threads at once, and the whole point is that both can have reads in flight. */
+        tr->uring = k3_uring_new(16);
         if (RING >= 2) {
+            io->ur = k3_uring_new(16);
             if (pthread_create(&io->thread, NULL, trunk_io_main, io) != 0) {
                 fprintf(stderr, "k3_trunk: cannot start asynchronous reader\n");
+                k3_uring_free(io->ur);
                 pthread_cond_destroy(&io->cv_work);
                 pthread_cond_destroy(&io->cv_done);
                 pthread_mutex_destroy(&io->mu);
@@ -463,9 +469,16 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                                                     : "LARGEST FIRST"),
                (double)biggest_unpinned / 1e9, (double)biggest / 1e9);
     }
-    printf("              reads use %s, pread in parallel %d MiB chunks\n",
+    printf("              reads use %s, %s\n",
            tr->direct ? "O_DIRECT (page cache bypassed)" : "buffered I/O",
-           (int)(K3_TRUNK_CHUNK >> 20));
+           tr->uring
+             ? (k3_uring_sqpoll((const K3Uring *)tr->uring)
+                  ? "io_uring with SQPOLL" : "io_uring")
+             : "pread at queue depth 1");
+    if (tr->uring)
+        printf("              up to %u requests in flight per layer read: an NVMe device "
+               "does not reach\n              its rated bandwidth at depth one\n",
+               k3_uring_depth((const K3Uring *)tr->uring));
     if (RING < RING_WANT)
         printf("              ring held at %d slot%s: %d slots need %.2f GB and the "
                "trunk budget is %.2f GB.\n"
@@ -512,11 +525,13 @@ void k3_trunk_close(K3Trunk *tr)
             pthread_mutex_unlock(&io->mu);
             pthread_join(io->thread, NULL);
         }
+        k3_uring_free(io->ur);
         pthread_cond_destroy(&io->cv_work);
         pthread_cond_destroy(&io->cv_done);
         pthread_mutex_destroy(&io->mu);
         free(io);
     }
+    k3_uring_free((K3Uring *)tr->uring);
     if (tr->fd >= 0) close(tr->fd);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) k3_aligned_free(tr->pin[i]); free(tr->pin); }
     k3_aligned_free(tr->arena); free(tr->layer_of); free(tr->slot_of); free(tr->pin_of);
@@ -572,20 +587,35 @@ static int k3_alloc_direct(void **out, size_t bytes)
  * parallel (k3_cache.c cache_getmany). Splitting the layer into aligned chunks issued
  * under OpenMP gives the same depth. Chunks are multiples of K3_TRUNK_ALIGN and layer
  * offsets/sizes are too, so every chunk's offset and length stay aligned -- required
- * by O_DIRECT on Linux and harmless to F_NOCACHE on Darwin. K3_TRUNK_CHUNK (64 MiB) is
- * defined at the top of the file, next to the ring size.
+ * by O_DIRECT on Linux and harmless to F_NOCACHE on Darwin. */
+#define K3_TRUNK_CHUNK ((int64_t)64 << 20)   /* 64 MiB, a multiple of K3_TRUNK_ALIGN */
+
+/* Read one layer's run. `ur` may be NULL, in which case this is the chunked pread loop
+ * above; when present the transfer goes through the io_uring instead, with several
+ * requests outstanding at once. The two are interchangeable byte for byte, and an
+ * io_uring that refuses the transfer falls back to the pread loop.
  *
  * Timing and byte counts come back through out-parameters rather than being added to
  * the K3Trunk here: two threads call this concurrently now, and += on a shared double is
  * a data race whose symptom is a plausible-looking throughput figure. The reader thread
  * and the main thread both reach this function, so the fold-in has to happen under the
  * io mutex, not here; see the "Fold one completed read" step below. */
-static int load_run_to(K3Trunk *tr, int L, unsigned char *dst,
+static int load_run_to(K3Trunk *tr, int L, unsigned char *dst, K3Uring *ur,
                        double *secs, int64_t *bytes)
 {
     const K3TrunkLayer *lay = &tr->lay[L];
     const double t0 = now_s();
     const int64_t nb = lay->nbytes;
+
+    if (ur) {
+        const int64_t got = k3_uring_read(ur, tr->fd, dst, nb, lay->file_off);
+        if (got == nb) {
+            *secs = now_s() - t0;
+            *bytes = got;
+            return 0;
+        }
+        /* io_uring refused this transfer: fall through to pread */
+    }
     const int nchunk = (int)((nb + K3_TRUNK_CHUNK - 1) / K3_TRUNK_CHUNK);
     volatile int failed = 0;
 #ifdef _OPENMP
@@ -713,7 +743,7 @@ static void *trunk_io_main(void *arg)
 
         double secs = 0.0; int64_t bytes = 0;
         const int rc = load_run_to(tr, L, tr->arena + (size_t)slot * tr->slot_bytes,
-                                   &secs, &bytes);
+                                   io->ur, &secs, &bytes);
 
         pthread_mutex_lock(&io->mu);
         tally_locked(tr, L, secs, bytes);
@@ -753,7 +783,14 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
         base = tr->pin[tr->pin_of[L]];
         if (tr->slot_of[L] < 0) {            /* first touch: load once, keep forever */
             double secs = 0.0; int64_t bytes = 0;
-            const int rc = load_run_to(tr, L, base, &secs, &bytes);
+            /* tr->uring, NOT io->ur. An io_uring is a shared-memory protocol between one
+             * submitter and the kernel; driving one ring from two threads interleaves
+             * their head and tail updates, and the symptom is not corruption but a HANG:
+             * one thread reaps the other's completion, and the other waits forever for a
+             * completion that has already been consumed. That is exactly what handing
+             * the reader's ring to the main thread here did, and it reproduced as an
+             * intermittent stall in tests/unit/test_trunk.c at ring depths 2 and 3. */
+            const int rc = load_run_to(tr, L, base, tr->uring, &secs, &bytes);
             pthread_mutex_lock(&io->mu);
             tally_locked(tr, L, secs, bytes);
             if (rc == 0) { tr->slot_of[L] = L; tr->misses++; }
@@ -791,7 +828,7 @@ int k3_trunk_fetch(K3Trunk *tr, int L, unsigned char **out)
                 double secs = 0.0; int64_t bytes = 0;
                 const int rc = load_run_to(tr, L,
                                            tr->arena + (size_t)slot * tr->slot_bytes,
-                                           &secs, &bytes);
+                                           tr->uring, &secs, &bytes);
                 pthread_mutex_lock(&io->mu);
                 tally_locked(tr, L, secs, bytes);
                 io->pending[slot] = -1;

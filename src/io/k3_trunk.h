@@ -130,6 +130,9 @@ typedef struct {
      * a layer name before its read succeeds; bind waits for completion before consuming
      * it, and never lets the slot it is using be evicted underneath it. */
     void         *io_state;
+    /* The main thread's io_uring, when the platform has one. NULL means reads use pread,
+     * which is always correct and simply shallower. See k3_uring.h. */
+    void         *uring;
 
     /* stats */
     uint64_t     hits, misses;
