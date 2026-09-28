@@ -48,6 +48,8 @@ typedef struct {
 /* O_DIRECT alignment. Offset, length and buffer must all be multiples of this. */
 #define K3_ST_ALIGN 4096
 
+struct K3StIndex;             /* model.safetensors.index.json, read only to explain a miss */
+
 typedef struct {
     int       *fd;            /* one open descriptor per shard             */
     int       *dfd;           /* the same shards opened O_DIRECT, or -1    */
@@ -62,15 +64,48 @@ typedef struct {
 
     char      *strpool;       /* all names, one allocation                 */
     size_t     strcap, strlen_;
+
+    /* What the shard FILENAMES say about completeness. The released layout is
+     * model-NNNNN-of-MMMMM.safetensors, so the directory itself declares how many shards
+     * a full download has; `declared` is that MMMMM (0 when no file is named that way)
+     * and `numbered` how many such files are actually here. */
+    char      *dir;
+    int        declared, numbered;
+    struct K3StIndex *ix;     /* lazily read; owned by k3_st_close             */
 } K3St;
 
-/* Open every *.safetensors in dir and index every tensor. Returns 0 on success. */
+/* Open every *.safetensors in dir and index every tensor. Returns 0 on success. A
+ * directory whose filenames declare more shards than are present still opens (a subset
+ * is a legitimate thing to inspect) but says so on stderr, and every later miss is
+ * explained by k3_st_explain_missing. */
 int  k3_st_open(K3St *s, const char *dir);
 void k3_st_close(K3St *s);
 
 /* O(1) lookup. Returns NULL when absent, which callers must treat as fatal: a
  * silently missing weight reads as zeros and the model still runs, plausibly wrong. */
 const K3Tensor *k3_st_find(const K3St *s, const char *name);
+
+/* WHY A MISS IS TRIAGED
+ *   "missing language_model.model.layers.40.mlp.down_proj.weight" is the whole message a
+ *   partial download used to get, and it looks exactly like a wrong --model directory or
+ *   an engine bug. The directory can say more than that: the filenames declare the shard
+ *   count, so a missing shard can be NAMED; and model.safetensors.index.json, when the
+ *   checkpoint shipped one, says which file should carry the tensor and whether the
+ *   tensor exists in this checkpoint at all -- the case a file count gets exactly wrong
+ *   (every shard present, and the name was never there). */
+typedef enum {
+    K3_ST_MISS_SHARD_ABSENT,    /* the file that carries it is not in the directory  */
+    K3_ST_MISS_SHARD_MISMATCH,  /* the index names a file that is here but lacks it   */
+    K3_ST_MISS_NOT_IN_CHECKPOINT/* every declared shard is here (or the index says no) */
+} K3StMiss;
+
+/* Explain why `name` is absent, in one line written to buf. The index is read on the
+ * first call only, and only on this failure path: a clean open never pays for it. */
+K3StMiss k3_st_explain_missing(const K3St *s, const char *name, char *buf, size_t cap);
+
+/* Print that explanation to stderr ONCE per K3St, for the first miss a loader hits: a
+ * missing shard is thousands of missing tensors and one cause. */
+void k3_st_note_missing(const K3St *s, const char *name);
 
 /* Raw bytes, exactly as stored. buf must hold t->nbytes. Returns bytes read. */
 int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf);

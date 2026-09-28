@@ -24,10 +24,10 @@ int k3_expert_ref(const K3St *s, int layer, int expert, K3ExpertRef *r)
     for (int i = 0; i < 3; i++) {
         snprintf(name, sizeof name, EXPERT_FMT, layer, expert, W[i], "weight_packed");
         pk[i] = k3_st_find(s, name);
-        if (!pk[i]) { fprintf(stderr, "k3_load: missing %s\n", name); return -1; }
+        if (!pk[i]) { fprintf(stderr, "k3_load: missing %s\n", name); k3_st_note_missing(s, name); return -1; }
         snprintf(name, sizeof name, EXPERT_FMT, layer, expert, W[i], "weight_scale");
         sc[i] = k3_st_find(s, name);
-        if (!sc[i]) { fprintf(stderr, "k3_load: missing %s\n", name); return -1; }
+        if (!sc[i]) { fprintf(stderr, "k3_load: missing %s\n", name); k3_st_note_missing(s, name); return -1; }
 
         if (pk[i]->dtype != K3_DT_U8 || sc[i]->dtype != K3_DT_U8) {
             fprintf(stderr, "k3_load: L%d expert %d %s is not U8\n", layer, expert, W[i]);

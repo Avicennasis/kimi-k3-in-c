@@ -80,6 +80,7 @@ static int64_t plan_resolve(Plan *p, const K3St *s)
         q->t = k3_st_find(s, q->name);
         if (!q->t) {
             fprintf(stderr, "k3_bind: missing tensor %s\n", q->name);
+            k3_st_note_missing(s, q->name);   /* names the file, once per open */
             p->bad++;
             continue;
         }
@@ -517,6 +518,7 @@ static int model_matrix(const K3St *s, const char *name, int rows, int cols,
     const K3Tensor *t = k3_st_find(s, name);
     if (!t) {
         fprintf(stderr, "k3_model_stream: missing tensor %s\n", name);
+        k3_st_note_missing(s, name);
         return -1;
     }
     if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols) {

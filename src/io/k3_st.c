@@ -28,8 +28,49 @@
 #include <unistd.h>
 
 #include "k3_st.h"
+#include "json.h"             /* model.safetensors.index.json, on the failure path only */
 
 /* ------------------------------------------------------------------ helpers */
+
+/* model.safetensors.index.json is read lazily and only to explain a miss: a clean open
+ * never pays the parse (the released index maps 497,220 names), and a directory without
+ * one still gets the filename-based triage. */
+struct K3StIndex {
+    int   tried;              /* looked for the file already                        */
+    int   explained;          /* k3_st_note_missing has printed its one paragraph   */
+    jval *root;
+    jval *map;                /* the "weight_map" object, or NULL                   */
+};
+
+static const char *base_name_(const char *p)
+{
+    const char *b = strrchr(p, '/');
+#ifdef _WIN32
+    const char *b2 = strrchr(p, '\\');
+    if (b2 && (!b || b2 > b)) b = b2;
+#endif
+    return b ? b + 1 : p;
+}
+
+/* The released layout is model-NNNNN-of-MMMMM.safetensors. Returns 1 and the two
+ * numbers when a basename is of that form; width is the digit count of NNNNN, so a
+ * missing file can be named with the same padding. */
+static int shard_numbers(const char *base, int *idx, int *tot, int *width)
+{
+    const char *of = strstr(base, "-of-");
+    if (!of) return 0;
+    const char *p = of;
+    while (p > base && p[-1] >= '0' && p[-1] <= '9') p--;
+    if (p == of || p == base || p[-1] != '-') return 0;
+    char *end;
+    long i = strtol(p, &end, 10);
+    if (end != of) return 0;
+    long t = strtol(of + 4, &end, 10);
+    if (end == of + 4 || strcmp(end, ".safetensors") != 0) return 0;
+    if (i < 1 || t < 1 || i > t || t > 1000000) return 0;
+    *idx = (int)i; *tot = (int)t; *width = (int)(of - p);
+    return 1;
+}
 
 int k3_st_elemsize(K3Dtype d)
 {
@@ -440,11 +481,50 @@ int k3_st_open(K3St *s, const char *dir)
     s->path = files; s->nshard = nf;
     s->fd  = (int *)malloc(nf * sizeof(int));
     s->dfd = (int *)malloc(nf * sizeof(int));
+    s->dir = strdup(dir);
+    s->ix  = (struct K3StIndex *)calloc(1, sizeof *s->ix);
     /* k3_st_close, not free(files): s->path was aliased to `files` two lines above, so
      * freeing it here leaves s->path dangling and k3_st_close would free it a second
      * time. Let the one function that owns the teardown do all of it. */
-    if (!s->fd || !s->dfd) { k3_st_close(s); return -1; }
+    if (!s->fd || !s->dfd || !s->dir || !s->ix) { k3_st_close(s); return -1; }
     for (int i = 0; i < nf; i++) { s->fd[i] = -1; s->dfd[i] = -1; }
+
+    /* What the filenames declare. Saying "1 of 96 shards missing" here, before a single
+     * header is read, is the earliest the download script's warning ("a partial
+     * checkpoint does not fail loudly") can be made loud; the miss that follows names
+     * the file (k3_st_explain_missing). The open still succeeds: a subset directory is
+     * a legitimate thing to inspect. */
+    for (int i = 0; i < nf; i++) {
+        int idx, tot, width;
+        if (!shard_numbers(base_name_(files[i]), &idx, &tot, &width)) continue;
+        if (tot > s->declared) s->declared = tot;
+        s->numbered++;
+    }
+    if (s->declared > s->numbered) {
+        char first[128] = "";
+        int  gaps = 0;
+        for (int want = 1; want <= s->declared; want++) {
+            int here = 0;
+            for (int i = 0; i < nf && !here; i++) {
+                int idx, tot, width;
+                here = shard_numbers(base_name_(files[i]), &idx, &tot, &width) && idx == want;
+            }
+            if (here) continue;
+            if (!gaps) {
+                int width = 5;
+                for (int i = 0; i < nf; i++) {
+                    int idx, tot;
+                    if (shard_numbers(base_name_(files[i]), &idx, &tot, &width)) break;
+                }
+                snprintf(first, sizeof first, "model-%0*d-of-%0*d.safetensors",
+                         width, want, width, s->declared);
+            }
+            gaps++;
+        }
+        fprintf(stderr, "k3_st: note: the shard filenames in %s declare %d shards but only "
+                        "%d are here; %d missing, the first is %s\n",
+                dir, s->declared, s->numbered, gaps, first);
+    }
 
     Build b; memset(&b, 0, sizeof b);
     for (int i = 0; i < nf; i++) {
@@ -487,8 +567,132 @@ void k3_st_close(K3St *s)
     if (s->fd)  { for (int i = 0; i < s->nshard; i++) if (s->fd[i]  >= 0) close(s->fd[i]);  free(s->fd); }
     if (s->dfd) { for (int i = 0; i < s->nshard; i++) if (s->dfd[i] >= 0) close(s->dfd[i]); free(s->dfd); }
     if (s->path) { for (int i = 0; i < s->nshard; i++) free(s->path[i]); free(s->path); }
+    if (s->ix) { json_free_tree(s->ix->root); free(s->ix); }
+    free(s->dir);
     free(s->t); free(s->bucket); free(s->strpool);
     memset(s, 0, sizeof *s);
+}
+
+/* ------------------------------------------------------------------ triage */
+
+static void index_load(const K3St *s)
+{
+    struct K3StIndex *ix = s->ix;
+    if (!ix || ix->tried) return;
+    ix->tried = 1;
+    char path[4096];
+    if (snprintf(path, sizeof path, "%s/model.safetensors.index.json", s->dir) >= (int)sizeof path)
+        return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long sz = ftell(f);
+    /* The released index is ~50 MB. Anything past 256 MB is not an index. */
+    if (sz <= 0 || sz > (256L << 20) || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
+    char *txt = (char *)malloc((size_t)sz + 1);
+    if (!txt) { fclose(f); return; }
+    if (fread(txt, 1, (size_t)sz, f) != (size_t)sz) { free(txt); fclose(f); return; }
+    fclose(f);
+    txt[sz] = '\0';
+    ix->root = json_parse(txt, NULL);
+    free(txt);
+    jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
+    if (!map || map->t != J_OBJ) {
+        fprintf(stderr, "k3_st: note: %s has no usable weight_map; ignoring it\n", path);
+        json_free_tree(ix->root); ix->root = NULL;
+        return;
+    }
+    ix->map = map;
+}
+
+/* The shard basename the index declares for name: NULL when there is no index or the
+ * name is not listed (*listed tells the two apart). One linear pass over the map: this
+ * runs once, on the failure path. */
+static const char *index_shard(const K3St *s, const char *name, int *listed)
+{
+    *listed = 0;
+    index_load(s);
+    if (!s->ix || !s->ix->map) return NULL;
+    jval *v = json_get(s->ix->map, name);
+    if (!v) return NULL;
+    *listed = 1;
+    return v->t == J_STR ? v->str : NULL;
+}
+
+K3StMiss k3_st_explain_missing(const K3St *s, const char *name, char *buf, size_t cap)
+{
+    int listed = 0;
+    const char *auth = index_shard(s, name, &listed);
+    const int have_index = s->ix && s->ix->map;
+    char count[96];
+    if (s->declared > 0)
+        snprintf(count, sizeof count, "%d of %d declared shards are here", s->numbered, s->declared);
+    else
+        snprintf(count, sizeof count, "%d shard file(s) here, none numbered -of-", s->nshard);
+
+    if (auth) {
+        int present = 0;
+        for (int i = 0; i < s->nshard && !present; i++)
+            present = !strcmp(base_name_(s->path[i]), auth);
+        if (!present) {
+            snprintf(buf, cap, "model.safetensors.index.json puts it in %s, which is not in "
+                     "%s (%s): the download is incomplete; fetch that file", auth, s->dir, count);
+            return K3_ST_MISS_SHARD_ABSENT;
+        }
+        snprintf(buf, cap, "model.safetensors.index.json puts it in %s, which is here but "
+                 "whose header does not declare it: that file is not the one the index "
+                 "describes (truncated, or from another revision); re-fetch it", auth);
+        return K3_ST_MISS_SHARD_MISMATCH;
+    }
+    if (have_index) {
+        snprintf(buf, cap, "model.safetensors.index.json does not list it (%s): this "
+                 "checkpoint never had a tensor by that name, so the engine and the "
+                 "checkpoint disagree, not the download", count);
+        return K3_ST_MISS_NOT_IN_CHECKPOINT;
+    }
+    if (s->declared > s->numbered) {
+        /* No index: name the absent files from the numbering instead. */
+        int width = 5, n = 0;
+        for (int i = 0; i < s->nshard; i++) {
+            int idx, tot;
+            if (shard_numbers(base_name_(s->path[i]), &idx, &tot, &width)) break;
+        }
+        int w = snprintf(buf, cap, "no model.safetensors.index.json here; the filenames "
+                         "declare %d shards and %d are here, missing:", s->declared, s->numbered);
+        for (int want = 1; want <= s->declared && w >= 0 && (size_t)w < cap; want++) {
+            int here = 0;
+            for (int i = 0; i < s->nshard && !here; i++) {
+                int idx, tot, wd;
+                here = shard_numbers(base_name_(s->path[i]), &idx, &tot, &wd) && idx == want;
+            }
+            if (here) continue;
+            if (n < 4)
+                w += snprintf(buf + w, cap - (size_t)w, " model-%0*d-of-%0*d.safetensors",
+                              width, want, width, s->declared);
+            else if (n == 4)
+                w += snprintf(buf + w, cap - (size_t)w, " ...");
+            n++;
+        }
+        if (w >= 0 && (size_t)w < cap)
+            snprintf(buf + w, cap - (size_t)w, " (%d file%s); the tensor is in one of them",
+                     n, n == 1 ? "" : "s");
+        return K3_ST_MISS_SHARD_ABSENT;
+    }
+    snprintf(buf, cap, "no model.safetensors.index.json here, and %s, so every file a full "
+             "download would have is present: this checkpoint has no tensor by that name",
+             count);
+    return K3_ST_MISS_NOT_IN_CHECKPOINT;
+}
+
+void k3_st_note_missing(const K3St *s, const char *name)
+{
+    if (!s->ix || s->ix->explained) return;
+    s->ix->explained = 1;
+    char why[1024];
+    k3_st_explain_missing(s, name, why, sizeof why);
+    fprintf(stderr, "k3_st: %s is missing: %s\n"
+                    "       (later misses in this run are reported by name only; they share this cause)\n",
+            name, why);
 }
 
 const K3Tensor *k3_st_find(const K3St *s, const char *name)
