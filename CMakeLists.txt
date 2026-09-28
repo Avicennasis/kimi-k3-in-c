@@ -116,7 +116,7 @@ if(K3_OPENMP_TARGET)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
-add_executable(k3_cli src/cli/k3_run.c)
+add_executable(k3_cli src/cli/k3_run.c src/cli/k3_state.c)
 set_target_properties(k3_cli PROPERTIES OUTPUT_NAME k3)
 
 # Chat is deliberately separate from the inference library: it is CLI policy and
@@ -151,6 +151,9 @@ k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
 k3_add_test(test_chat   tests/unit/test_chat.c)
 k3_add_test(test_st_faults tests/unit/test_st_faults.c)
+k3_add_test(test_state  tests/unit/test_state.c)
+target_sources(test_state PRIVATE src/cli/k3_state.c)
+target_include_directories(test_state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
 target_link_libraries(test_chat PRIVATE k3_chat)
 k3_add_test(scale_test  tests/unit/scale_test.c)
 k3_add_test(test_trunk  tests/unit/test_trunk.c)
@@ -188,6 +191,7 @@ add_test(NAME config_reject_bad_topk
 add_test(NAME safetensors COMMAND test_st   ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR}/idx.json
          plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32)
 add_test(NAME shard_faults COMMAND test_st_faults ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR}/stfault)
+add_test(NAME state_file COMMAND test_state ${CMAKE_CURRENT_BINARY_DIR}/state)
 add_test(NAME model_stream COMMAND test_model_stream ${FIX}/st)
 add_test(NAME ultra_cli_contract
          COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:k3_cli>
