@@ -66,6 +66,7 @@
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_chat.h"
+#include "k3_prefix.h"
 #include "k3_sampler.h"
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
 
@@ -396,7 +397,9 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "chat (text-only Kimi K3 XTML):\n"
-"  --chat                terminal REPL; uses the official XTML template\n"
+"  --chat                terminal REPL; uses the official XTML template. With\n"
+"                        --incremental each turn prefills only what the previous\n"
+"                        turn did not already feed the model\n"
 "  --system TEXT         initial system message (stored in --history)\n"
 "  --history PATH        portable JSONL transcript; rebuilt on restart\n"
 "  --temperature X       turn chat sampling on, at this temperature (default: greedy)\n"
@@ -681,8 +684,12 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
 /* ----------------------------------------------------------------------- chat ----
  * Chat deliberately owns only transcript and decode policy.  It calls the exact same
  * forward() and streamed K3Cache as batch mode, so --preset/--trunk-gb/--cache-gb keep
- * their meanings.  The first version re-prefills the full transcript for every REPL
- * turn; retaining a live suffix is enabled only after its equivalence gate exists. */
+ * their meanings.  With --incremental a turn keeps the KV cache and recurrent state it
+ * built, and the next turn prefills only its new tail when the rendered transcript
+ * begins with exactly the ids that state was fed (src/chat/k3_prefix.h); any divergence,
+ * including /reset, starts over.  GATE 3b of tests/unit/k3_model.c holds the reused path
+ * bit-identical to a full prefill.  Full recompute (no --incremental) carries no state
+ * and still re-runs the whole transcript every step. */
 static int chat_read_line(char **out)
 {
     char *line = NULL; size_t cap = 0;
@@ -727,9 +734,10 @@ static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
     float *ns = (float *)malloc(sc_need * sizeof(*ns));
     int *nq = (int *)malloc((size_t)(want + 8) * sizeof(*nq));
     float *nk = NULL, *nr = NULL;
+    const size_t kvrow = (size_t)c->n_heads * (c->qk_nope + c->v_head);
+    const size_t kvper = (size_t)want * kvrow;
+    const size_t rpper = (size_t)want * c->qk_rope;
     if (w->kvc) {
-        const size_t kvper = (size_t)want * c->n_heads * (c->qk_nope + c->v_head);
-        const size_t rpper = (size_t)want * c->qk_rope;
         nk = (float *)calloc(kvper * (size_t)w->n_mla, sizeof(*nk));
         nr = (float *)calloc(rpper * (size_t)w->n_mla, sizeof(*nr));
     }
@@ -739,7 +747,21 @@ static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
     }
     free(*h); free(*br); free(*sc); free(*seq);
     *h = nh; *br = nb; *sc = ns; *seq = nq;
-    if (w->kvc) { free(w->kvc); free(w->ropec); w->kvc = nk; w->ropec = nr; w->kv_cap = want; }
+    if (w->kvc) {
+        /* Grow by COPYING the positions already cached: they are what the next turn
+         * reuses. Rows are [pos][H][kvd] per MLA layer, so the per-layer stride changes
+         * with the capacity and the copy is one memcpy per layer, not one for the lot. */
+        const size_t old_kv = (size_t)w->kv_cap * kvrow;
+        const size_t old_rp = (size_t)w->kv_cap * c->qk_rope;
+        const size_t keep = (size_t)(w->cached > 0 ? w->cached : 0);
+        for (int mi = 0; mi < w->n_mla; mi++) {
+            memcpy(nk + (size_t)mi * kvper, w->kvc + (size_t)mi * old_kv,
+                   keep * kvrow * sizeof(*nk));
+            memcpy(nr + (size_t)mi * rpper, w->ropec + (size_t)mi * old_rp,
+                   keep * (size_t)c->qk_rope * sizeof(*nr));
+        }
+        free(w->kvc); free(w->ropec); w->kvc = nk; w->ropec = nr; w->kv_cap = want;
+    }
     *tmax = want;
     (void)nl; (void)kper;
     return 0;
@@ -750,7 +772,8 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
                     int incremental, int greedy, double temperature, double top_p,
                     uint64_t seed, Weights *w, const K3Cfg *c, K3Cache *cache,
                     int nl, int *tmax, float **h, float **br, float *ks,
-                    float **sc, float *lg, int **seq, int *outtok, int maxb, size_t kper)
+                    float **sc, float *lg, int **seq, int *outtok, int maxb, size_t kper,
+                    K3Prefix *pf)
 {
     char err[512]; int turn = 0;
     int *prompt = *prompt_ref;
@@ -771,28 +794,51 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
                 return 1;
             }
         }
-        if (chat_resize(need, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
-        memcpy(*seq, prompt, (size_t)np * sizeof(**seq));
-        memset(ks, 0, kper * (size_t)nl * sizeof(*ks));
-        if (incremental) {
-            const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
-            const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
-            memset(w->kvc, 0, kvper * (size_t)w->n_mla * sizeof(*w->kvc));
-            memset(w->ropec, 0, rpper * (size_t)w->n_mla * sizeof(*w->ropec));
+        {
+            const int old_tmax = *tmax;
+            if (chat_resize(need, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
+            /* The KV cache grew by copying its cached positions (chat_resize), so the
+             * record grows with it. If the record cannot be preserved it is dropped and
+             * this turn re-prefills; reuse is an optimisation, never a reason to fail. */
+            if (*tmax != old_tmax && incremental) (void)k3_prefix_grow(pf, *tmax, w->cached);
         }
-        w->cached = 0;
+        memcpy(*seq, prompt, (size_t)np * sizeof(**seq));
+        /* Reuse the previous turn's state only when this prompt begins with EXACTLY the
+         * ids that state was built from, and the engine agrees about how many that is.
+         * Anything else -- turn 1, /reset, an edited transcript, a failed forward last
+         * turn -- clears every carried buffer and prefills from position 0, which is what
+         * every turn did before. */
+        int base = incremental ? k3_prefix_reuse(pf, prompt, np) : 0;
+        if (base > 0 && base != w->cached) base = 0;
+        if (base == 0) {
+            memset(ks, 0, kper * (size_t)nl * sizeof(*ks));
+            if (incremental) {
+                const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+                const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+                memset(w->kvc, 0, kvper * (size_t)w->n_mla * sizeof(*w->kvc));
+                memset(w->ropec, 0, rpper * (size_t)w->n_mla * sizeof(*w->ropec));
+                k3_prefix_clear(pf);
+            }
+            w->cached = 0;
+        }
+        if (incremental)
+            printf("chat: %d of %d prompt positions already cached, prefilling %d\n",
+                   base, np, np - base);
         int T = np, nraw = 0, frc = 0;
         K3Sampler sampler; k3_sampler_init(&sampler, temperature, top_p, seed, (uint64_t)(turn + 1));
         const double t_turn0 = now_s();
         while (nraw < gen) {
             if (incremental) {
+                /* Record ids WHERE THEY ARE FED (k3_prefix.h): the record, not the
+                 * REPL's arithmetic, is what the next turn's reuse decision consults. */
                 if (!nraw) {
-                    frc = forward(w, c, cache, *seq, T, lg, *sc, *h, *br, ks, NULL);
-                    if (!frc) w->cached = T;
+                    frc = forward(w, c, cache, *seq + base, T - base, lg, *sc, *h, *br, ks, NULL);
+                    if (!frc) { w->cached = T; k3_prefix_record(pf, *seq + base, base, T - base); }
                 } else {
                     frc = forward(w, c, cache, *seq + T - 1, 1, lg, *sc, *h, *br, ks, NULL);
-                    if (!frc) w->cached++;
+                    if (!frc) { w->cached++; k3_prefix_record(pf, *seq + T - 1, T - 1, 1); }
                 }
+                if (frc) k3_prefix_clear(pf);   /* the state absorbed part of a failed step */
             } else {
                 frc = forward(w, c, cache, *seq, T, lg, *sc, *h, *br, ks, NULL);
             }
@@ -1634,10 +1680,16 @@ int main(int argc, char **argv)
     }
 
     if (chat) {
+        /* The record of what the carried state was built from. Sized with the KV cache
+         * and grown with it; if it cannot be allocated every turn simply re-prefills. */
+        K3Prefix pf; memset(&pf, 0, sizeof pf);
+        if (incremental && !k3_prefix_alloc(&pf, Tmax))
+            fprintf(stderr, "chat: no memory for the prefix record; every turn will re-prefill\n");
         const int rc = chat_run(&tok, &chat_template, &chat_history, &chat_opts, history_path,
                                 &prompt, np, gen, incremental, greedy, temperature,
                                 top_p, seed, &w, &c, &cache, NL, &Tmax, &h, &br, ks,
-                                &sc, lg, &seq, outtok, maxb, kper);
+                                &sc, lg, &seq, outtok, maxb, kper, &pf);
+        k3_prefix_free(&pf);
         free(w.kvc); free(w.ropec); free(w.mla_slot);
         if (w.trunk) k3_trunk_close(w.trunk);
         k3_cache_free(&cache);

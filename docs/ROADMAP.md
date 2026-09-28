@@ -40,10 +40,14 @@ is a property the test suite depends on.
 
 ## 6. Chat retained-state equivalence
 
-Text chat now implements K3's official XTML formatting, JSONL restart, and safe complete
-history re-prefill. The next optimization is retaining in-process KDA/MLA state across
-REPL turns only after an equivalence gate proves that its token stream matches a full
-re-prefill of the same transcript.
+Text chat implements K3's official XTML formatting, JSONL restart, and, under
+`--incremental`, retains the KDA/MLA state across REPL turns: the ids are recorded where
+they are fed (`src/chat/k3_prefix.h`), and a turn whose rendered transcript begins with
+exactly that record prefills only its tail. The equivalence gate that had to exist first
+is GATE 3b of `tests/unit/k3_model.c`: turn 2 on top of turn 1's state must be
+bit-identical -- logits, every KV row, the KDA state -- to a full prefill of the same
+transcript. Any divergence (`/reset`, an edited history) starts over. Restart from a
+`--history` file still re-prefills: no opaque state is serialised.
 
 ## 7. Vision
 

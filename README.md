@@ -457,7 +457,10 @@ canonical record, including `<think>…</think>` and `<response>…</response>`.
 Treat that file as sensitive: it can contain every user message and the complete assistant
 reasoning record, which K3 requires to continue a conversation faithfully. On restart the
 engine validates, re-renders, and re-prefills the transcript; it deliberately does not
-serialize opaque KV, MLA, or KDA state. A supplied `--system` must exactly match an existing
+serialize opaque KV, MLA, or KDA state. Within one session under `--incremental` the
+state a turn built is kept, and the next turn prefills only its new tail when the
+rendered transcript begins with exactly the ids that state was fed (the REPL prints how
+many positions were reused); `/reset` or any other divergence starts over. A supplied `--system` must exactly match an existing
 initial system record. Literal control-marker text in user messages is encoded as ordinary
 text, never as an XTML control token.
 

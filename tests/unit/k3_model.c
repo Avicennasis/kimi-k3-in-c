@@ -231,6 +231,41 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* One INCREMENTAL forward: nT tokens at absolute positions base..base+nT-1 through the
+ * cached decoder, carrying the KDA state in ks and the MLA KV cache in kvc/rpc, writing
+ * the logits of the LAST new position to lg. This is the shape of every call the CLI's
+ * --incremental and --chat paths make: the whole prompt once, then one token per step,
+ * and (chat) the next turn's tail on top of the previous turn's state. */
+static void inc_forward(Model *m, const K3Cfg *c, const int *ids, int base, int nT, int cap,
+                        float *kvc, float *rpc, size_t kvper, size_t rpper,
+                        float *ks, size_t kper, float *sc, float *h, float *br, float *lg)
+{
+    const int E = c->hidden;
+    const int maxb = c->n_layers / c->attn_res_block + 2;
+    for (int t = 0; t < nT; t++)
+        memcpy(h + (size_t)t * E, m->embed + (size_t)ids[t] * E, (size_t)E * sizeof(float));
+    memset(br, 0, (size_t)nT * (size_t)maxb * (size_t)E * sizeof(float));
+    int nb = 0;
+    for (int L = 0; L < c->n_layers; L++)
+        k3_decoder_layer_inc(h, br, &nb, &m->lay[L], c, L, nT,
+                             ks + kper * (size_t)L, sc,
+                             kvc + kvper * (size_t)L, rpc + rpper * (size_t)L, base, cap);
+    /* model-level aggregator and head, on the LAST new position */
+    float *fold = sc, *src = fold + E;
+    const int lastt = nT - 1;
+    if (m->out_res_norm && m->out_res_proj) {
+        for (int i = 0; i < E; i++) fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
+        for (int b = 0; b < nb; b++)
+            memcpy(src + (size_t)b * E, br + ((size_t)lastt * maxb + b) * E,
+                   (size_t)E * sizeof(float));
+        memcpy(src + (size_t)nb * E, h + (size_t)lastt * E, (size_t)E * sizeof(float));
+        k3_attn_res(h + (size_t)lastt * E, src, fold, nb + 1, E, c->rms_eps);
+    }
+    float *nrm = sc;
+    k3_rmsnorm(nrm, h + (size_t)lastt * E, m->final_norm, E, c->rms_eps);
+    k3_matmul(lg, nrm, m->lm_head, E, c->vocab);
+}
+
 /* Config is read through k3_cfg.h, which never substitutes a default for a missing
  * field: it collects every absent key and refuses the load. Do not reintroduce a
  * defaulting reader here. A default turns "this program cannot understand this config"
@@ -390,37 +425,8 @@ int main(int argc, char **argv)
                 /* first call feeds the whole prompt, later calls feed one token */
                 const int base = cached;
                 const int nT   = (step == 0) ? np : 1;
-                for (int t = 0; t < nT; t++)
-                    memcpy(h_i + (size_t)t * c.hidden,
-                           m->embed + (size_t)gi[base + t] * c.hidden,
-                           (size_t)c.hidden * sizeof(float));
-                memset(br_i, 0, (size_t)nT * (size_t)maxb * (size_t)c.hidden * sizeof(float));
-                int nb_i = 0;
-                for (int L = 0; L < c.n_layers; L++)
-                    k3_decoder_layer_inc(h_i, br_i, &nb_i, &m->lay[L], &c, L, nT,
-                                         ks_i + kper * (size_t)L, sc_i,
-                                         kvc + kvper * (size_t)L,
-                                         rpc + rpper * (size_t)L, base, T);
-                /* model-level aggregator and head, on the LAST new position */
-                float *fold = sc_i, *src = fold + c.hidden;
-                const int lastt = nT - 1;
-                if (m->out_res_norm && m->out_res_proj) {
-                    for (int i = 0; i < c.hidden; i++)
-                        fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
-                    for (int b = 0; b < nb_i; b++)
-                        memcpy(src + (size_t)b * c.hidden,
-                               br_i + ((size_t)lastt * maxb + b) * c.hidden,
-                               (size_t)c.hidden * sizeof(float));
-                    memcpy(src + (size_t)nb_i * c.hidden,
-                           h_i + (size_t)lastt * c.hidden, (size_t)c.hidden * sizeof(float));
-                    k3_attn_res(h_i + (size_t)lastt * c.hidden, src, fold,
-                                nb_i + 1, c.hidden, c.rms_eps);
-                }
-                float *nrm = sc_i;
-                k3_rmsnorm(nrm, h_i + (size_t)lastt * c.hidden, m->final_norm,
-                           c.hidden, c.rms_eps);
-                k3_matmul(lg_i, nrm, m->lm_head, c.hidden, c.vocab);
-
+                inc_forward(m, &c, gi + base, base, nT, T, kvc, rpc, kvper, rpper,
+                            ks_i, kper, sc_i, h_i, br_i, lg_i);
                 cached = base + nT;
                 if (cached >= T) break;
                 gi[cached] = argmax_(lg_i, c.vocab);
@@ -430,6 +436,56 @@ int main(int argc, char **argv)
         printf("GATE 3  incremental    : %d/%d generated tokens match full_ids"
                "  <- KV cache + carried KDA state\n", iok, T - np);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
+
+        /* ---- GATE 3b: PREFIX REUSE across REPL turns --------------------------------
+         * The chat REPL keeps the state a turn leaves behind and, when the next prompt
+         * begins with exactly the ids that state was built from (src/chat/k3_prefix.h),
+         * prefills only the tail instead of the whole transcript. That is sound only if
+         * feeding [0..k) as a turn -- the prompt in one chunk, then one token per step,
+         * exactly as chat_run feeds them -- and then [k..T) as the next turn's tail leaves
+         * the engine in the SAME state as feeding [0..T) at once: every KV row, the KDA
+         * matrix, the ShortConv history. Demand bit-identical logits at position T-1 and
+         * bit-identical KV caches; token equality would hide a near tie or a stale row.
+         * This is the equivalence gate the REPL's first version said it was waiting for
+         * before retaining a live suffix. */
+        int pr_ok = 0;
+        {
+            const int k = np + (T - np) / 2;        /* turn 1 ends here; turn 2 adds T-k */
+            float *kvc2 = (float *)calloc(kvper * (size_t)c.n_layers, sizeof(float));
+            float *rpc2 = (float *)calloc(rpper * (size_t)c.n_layers, sizeof(float));
+            float *ks2  = (float *)calloc(kper * (size_t)c.n_layers, sizeof(float));
+            float *lg2  = (float *)malloc((size_t)c.vocab * sizeof(float));
+            if (kvc2 && rpc2 && ks2 && lg2 && kvc && rpc && ks_i && lg_i && sc_i && h_i && br_i
+                && k > np && k < T) {
+                /* turn 1 as the REPL feeds it, on the state left by GATE 3, cleared */
+                memset(kvc, 0, kvper * (size_t)c.n_layers * sizeof(float));
+                memset(rpc, 0, rpper * (size_t)c.n_layers * sizeof(float));
+                memset(ks_i, 0, kper * (size_t)c.n_layers * sizeof(float));
+                inc_forward(m, &c, full, 0, np, T, kvc, rpc, kvper, rpper,
+                            ks_i, kper, sc_i, h_i, br_i, lg_i);
+                for (int pos = np; pos < k; pos++)
+                    inc_forward(m, &c, full + pos, pos, 1, T, kvc, rpc, kvper, rpper,
+                                ks_i, kper, sc_i, h_i, br_i, lg_i);
+                /* turn 2: only the tail, on top of turn 1's state */
+                inc_forward(m, &c, full + k, k, T - k, T, kvc, rpc, kvper, rpper,
+                            ks_i, kper, sc_i, h_i, br_i, lg_i);
+                /* the reference: the whole turn-2 prompt from a cleared state, which is
+                 * what the REPL did before */
+                inc_forward(m, &c, full, 0, T, T, kvc2, rpc2, kvper, rpper,
+                            ks2, kper, sc_i, h_i, br_i, lg2);
+                pr_ok = memcmp(lg_i, lg2, (size_t)c.vocab * sizeof(float)) == 0
+                     && memcmp(kvc, kvc2, kvper * (size_t)c.n_layers * sizeof(float)) == 0
+                     && memcmp(rpc, rpc2, rpper * (size_t)c.n_layers * sizeof(float)) == 0
+                     && memcmp(ks_i, ks2, kper * (size_t)c.n_layers * sizeof(float)) == 0;
+                printf("GATE 3b prefix reuse   : %s  <- turn 2 (%d reused + %d new) "
+                       "bit-identical to a full %d-token prefill: logits, KV, KDA state\n",
+                       pr_ok ? "PASS" : "FAIL", k, T - k, T);
+            } else {
+                printf("GATE 3b prefix reuse   : FAIL  <- could not allocate or split\n");
+            }
+            free(kvc2); free(rpc2); free(ks2); free(lg2);
+        }
+        gok = pr_ok ? gok : -1;
         free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i); free(lg_i); free(gi);
     }
 
