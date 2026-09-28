@@ -68,6 +68,7 @@
 #include "k3_chat.h"
 #include "k3_sampler.h"
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_sysmem.h" /* available/total memory on Linux, Darwin and Windows */
 
 static double now_s(void)
 {
@@ -506,31 +507,6 @@ static double peak_rss_bytes(void)
 #endif
 }
 
-/* MemAvailable, which is what the kernel thinks can actually be handed out, not
- * MemFree. Returns 0 if it cannot be read. */
-static double mem_available_bytes(void)
-{
-#ifdef _WIN32
-    /* ullAvailPhys is Windows' MemAvailable equivalent: physical memory that can
-     * actually be handed out (already accounts for the standby/modified page
-     * lists the way MemAvailable accounts for reclaimable cache), not the raw
-     * free count. */
-    MEMORYSTATUSEX ms;
-    ms.dwLength = sizeof ms;
-    if (!GlobalMemoryStatusEx(&ms)) return 0.0;
-    return (double)ms.ullAvailPhys;
-#else
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0.0;
-    char line[256];
-    double kb = 0.0;
-    while (fgets(line, sizeof line, f))
-        if (!strncmp(line, "MemAvailable:", 13)) { kb = atof(line + 13); break; }
-    fclose(f);
-    return kb * 1024.0;
-#endif
-}
-
 typedef struct {
     K3LayerBind *lay;
     K3ModelBind  mb;
@@ -763,7 +739,7 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
         }
         if (incremental) {
             const double kv_need = (double)need * K3_KV_BYTES_PER_POS;
-            const double avail = mem_available_bytes();
+            const double avail = k3_mem_available_bytes();
             if (avail > 0.0 && kv_need > avail * 0.9) {
                 char kb[32], ab[32];
                 human(kv_need, kb, sizeof kb); human(avail, ab, sizeof ab);
@@ -1097,10 +1073,10 @@ int main(int argc, char **argv)
      * this machine has, minus a safety margin, and the cache gets real memory only
      * after the whole 110 GB trunk would be resident. */
     if (budget_auto) {
-        const double avail = mem_available_bytes();
+        const double avail = k3_mem_available_bytes();
         if (avail <= 0.0) {
-            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
-                            "--trunk-gb/--cache-gb on this platform\n");
+            fprintf(stderr, "--preset auto could not read this machine's available memory; "
+                            "pass explicit --trunk-gb/--cache-gb\n");
             return 2;
         }
         /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
@@ -1131,24 +1107,9 @@ int main(int argc, char **argv)
              * mildly positive (40.1 s/token at 25 GB, device throughput unharmed).
              * So below full residency, auto pins only while the whole process stays
              * comfortably clear of the RAM ceiling. */
-            double memtotal = 0.0;
-#ifdef _WIN32
-            {
-                MEMORYSTATUSEX ms;
-                ms.dwLength = sizeof ms;
-                if (GlobalMemoryStatusEx(&ms)) memtotal = (double)ms.ullTotalPhys;
-            }
-#else
-            FILE *mf = fopen("/proc/meminfo", "r");
-            if (mf) {
-                char ln[256];
-                while (fgets(ln, sizeof ln, mf))
-                    if (!strncmp(ln, "MemTotal:", 9)) { memtotal = atof(ln + 9) * 1024.0; break; }
-                fclose(mf);
-            }
-#endif
+            const double memtotal = k3_mem_total_bytes();
             const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9
-                                                      : usable;   /* no /proc: keep old cap */
+                                                      : usable;   /* total unknown: keep old cap */
             double cap = rss_ceiling - reserve - cache_min;
             if (cap < slot_min) cap = slot_min;
             trunk_gb = usable - cache_min;
@@ -1346,7 +1307,7 @@ int main(int argc, char **argv)
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     if (incremental) {
         const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
-        const double avail   = mem_available_bytes();
+        const double avail   = k3_mem_available_bytes();
         char kb[32], ab[32];
         human(kv_need, kb, sizeof kb);
         human(avail, ab, sizeof ab);
@@ -1438,7 +1399,7 @@ int main(int argc, char **argv)
               * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
             : 0.0;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
-        const double have = mem_available_bytes();
+        const double have = k3_mem_available_bytes();
 
         char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
         human(w_kv, b7, sizeof b7);
