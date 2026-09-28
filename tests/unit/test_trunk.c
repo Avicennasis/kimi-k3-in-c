@@ -39,6 +39,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>            /* ftruncate */
+#ifndef _WIN32
+#include <pthread.h>
+#include <sys/resource.h>   /* RLIMIT_NPROC: the cheap way to make pthread_create fail */
+#endif
 
 #include "k3.h"
 #include "k3_bind.h"
@@ -537,6 +541,41 @@ static int test_truncated(const char *dir, const K3Cfg *c)
     return 0;
 }
 
+#ifndef _WIN32
+static void *noop_thread(void *arg) { return arg; }
+
+/* §4 the reader thread cannot start. k3_trunk_open allocates the main thread's io_uring
+ * before it starts the reader, and used to return -1 from the pthread_create failure
+ * with that ring still owned by nobody. RLIMIT_NPROC is the cheap way to reach the
+ * path: with the soft limit at 1 every further clone fails with EAGAIN for an
+ * unprivileged user. Root is not bound by it, so a probe thread decides whether the
+ * case can run at all; a SKIP is printed rather than a pass that proved nothing. */
+static int test_reader_start_failure(const char *dir, const K3Cfg *c)
+{
+    printf("== reader cannot start ==\n");
+    struct rlimit old, lim;
+    if (getrlimit(RLIMIT_NPROC, &old) != 0) { printf("  SKIP  getrlimit failed\n"); return 0; }
+    lim = old; lim.rlim_cur = 1;
+    if (setrlimit(RLIMIT_NPROC, &lim) != 0) { printf("  SKIP  cannot lower RLIMIT_NPROC\n"); return 0; }
+    pthread_t probe;
+    if (pthread_create(&probe, NULL, noop_thread, NULL) == 0) {
+        pthread_join(probe, NULL);
+        setrlimit(RLIMIT_NPROC, &old);
+        printf("  SKIP  RLIMIT_NPROC not enforced here (root?), path unreachable\n");
+        return 0;
+    }
+    K3Trunk tr;
+    const int rc = k3_trunk_open(&tr, dir, c, 24576, 0);   /* two slots: wants the reader */
+    setrlimit(RLIMIT_NPROC, &old);
+    const int before = g_fail;
+    ck(rc != 0, "open refuses when the reader cannot start", NULL);
+    ck(tr.io_state == NULL, "reader state released on that path", NULL);
+    ck(tr.uring == NULL, "main-thread io_uring released on that path", NULL);
+    k3_trunk_close(&tr);   /* the rest of the half-open trunk, as a caller would */
+    return g_fail != before;
+}
+#endif
+
 int main(void)
 {
     /* Construct a minimal K3Cfg matching the fixture dimensions. */
@@ -625,6 +664,16 @@ int main(void)
     } else {
         if (test_truncated(tmpdir, &c) != 0) g_fail++;
     }
+
+    /* §4 reader thread cannot start (POSIX only: RLIMIT_NPROC) */
+#ifndef _WIN32
+    printf("\n");
+    if (gen_fixture(tmpdir) != 0) {
+        fprintf(stderr, "FAILED to re-generate fixture\n"); g_fail++;
+    } else {
+        if (test_reader_start_failure(tmpdir, &c) != 0) g_fail++;
+    }
+#endif
 
     /* Clean up temp files */
     {

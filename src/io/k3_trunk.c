@@ -442,6 +442,10 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
                 pthread_mutex_destroy(&io->mu);
                 free(io);
                 tr->io_state = NULL;
+                /* The main thread's ring was made a few lines up and belongs to this
+                 * open; a caller that gives up on -1 has no handle to release it. */
+                k3_uring_free((K3Uring *)tr->uring);
+                tr->uring = NULL;
                 return -1;
             }
             tr->reader_started = 1;
