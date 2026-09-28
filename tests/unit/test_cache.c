@@ -36,6 +36,15 @@
 #include "k3_load.h"
 #include "k3_st.h"
 
+/* The policy and speculation switches are read through getenv, and this test flips
+ * them between sections. MinGW's CRT has no setenv/unsetenv (the Windows job links
+ * this file with -static, and the link fails on both symbols); _putenv_s covers both,
+ * with an empty value meaning removal, and getenv then returns NULL as on POSIX. */
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s((name), (value))
+#define unsetenv(name) _putenv_s((name), "")
+#endif
+
 static int g_fail = 0;
 
 static void ck(int ok, const char *what, const char *detail)
